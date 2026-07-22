@@ -1,0 +1,15 @@
+# Example bktunnel instance config — copy to /etc/bktunnel/<name>.conf and edit,
+# then: sudo systemctl enable --now bktunnel@<name>
+#
+# This example is a CLIENT tunnel that exposes a remote MQTT broker locally:
+# apps connect to 127.0.0.1:1883 and the traffic rides pinned, mutually-
+# authenticated TLS to server.example:5560, which forwards to its local broker.
+#
+# ROLE     client | server
+# ACCEPT   address:port this instance LISTENS on
+#            client: local plaintext in;   server: TLS in from peers
+# CONNECT  address:port this instance FORWARDS to
+#            client: the remote server;    server: the local service
+ROLE=client
+ACCEPT=127.0.0.1:1883
+CONNECT=server.example:5560

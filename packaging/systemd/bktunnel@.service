@@ -1,0 +1,66 @@
+# systemd TEMPLATE unit for bktunnel — one tunnel per instance.
+#
+#   sudo systemctl enable --now bktunnel@mqtt
+#
+# runs an instance named "mqtt" that reads:
+#   /etc/bktunnel/mqtt.conf    ROLE / ACCEPT / CONNECT   (see bktunnel.conf.example)
+#   /etc/bktunnel/mqtt.key     this host's private key   (0600, root-owned)
+#   /etc/bktunnel/mqtt.peers   pinned peer pubkey(s)     (see bktunnel.peers.example)
+#
+# Works with either implementation installed at /usr/bin/bktunnel (the bash
+# script or the Go binary). See packaging/systemd/README.md for setup. The hardening below
+# is a sane starting point — loosen individual directives if something breaks.
+
+[Unit]
+Description=bktunnel pinned-identity TLS tunnel (%i)
+Documentation=https://github.com/zziigguurraatt/bktunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/bktunnel/%i.conf
+
+# Load the private key into a per-service tmpfs credentials directory, so it is
+# never passed on the command line (visible in `ps`) nor via the environment
+# (readable in /proc/PID/environ). Requires systemd >= 247. bktunnel reads it
+# with -k @<file>; $CREDENTIALS_DIRECTORY is set by systemd for this service.
+LoadCredential=privkey:/etc/bktunnel/%i.key
+ExecStart=/usr/bin/bktunnel -r ${ROLE} -a ${ACCEPT} -c ${CONNECT} \
+    -k @${CREDENTIALS_DIRECTORY}/privkey -p @/etc/bktunnel/%i.peers
+
+Restart=on-failure
+RestartSec=2
+
+# --- Isolation & hardening ---------------------------------------------------
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+# PrivateTmp gives a private, writable /dev/shm — the tmpfs the bash
+# implementation uses for its ephemeral key/cert material.
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+# No capabilities are needed to bind a high port (the examples use :5560/:1883).
+# To bind a privileged port (<1024), remove the empty set below and instead add:
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

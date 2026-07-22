@@ -1,0 +1,4 @@
+# Pinned peer public keys — copy to /etc/bktunnel/<name>.peers, one per line.
+# For a CLIENT instance this is the SERVER's pubkey; for a SERVER instance it is
+# each allowed CLIENT's pubkey. Blank lines and '#' comments are ignored.
+wwy/Nwo5y+eUPl7P+dv5CjT9fybiarNipZ+q+NZNsZg=

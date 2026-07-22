@@ -1,0 +1,31 @@
+# Build output — `make build`, `make build-all`, `make deb*`, `make docker-*`
+/build/
+
+# Nix build result symlink — `nix build`
+/result
+/result-*
+
+# Go binary if compiled in place instead of into build/ (the root `bktunnel`
+# is the tracked bash script, so only ignore the Go paths)
+/go/bktunnel
+/go/cmd/bktunnel/bktunnel
+
+# Go test leftovers
+*.test
+coverage.out
+
+# Generated key material — never commit private keys. `-g` writes a private key
+# plus <name>.pub; the examples/tests use *.key, and the default identity is
+# id_ed25519. Ad-hoc test keys with arbitrary names go in scratch/.
+*.key
+*.pub
+id_ed25519
+/scratch/
+
+# Commit-message scratchpad (git commit -F commit-message.txt)
+commit-message.txt
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store

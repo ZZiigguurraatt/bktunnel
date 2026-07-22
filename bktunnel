@@ -1,0 +1,466 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================================
+# HARDCODED CONFIGURATION
+# ----------------------------------------------------------------------------
+# These are the built-in policy/structure choices. They are intentionally NOT
+# command-line flags: they define what this tool *is* (a pinned-identity,
+# mutual-auth, RAM-only Ed25519 stunnel wrapper). Change them here if you must,
+# but understand each before you do - several are security-relevant.
+# ============================================================================
+
+# --- Cryptography (SECURITY-RELEVANT - do not change casually) --------------
+
+# Public-key algorithm for the node identity key. Everything below assumes
+# Ed25519; changing this string alone is NOT enough (see the DER headers).
+CFG_ALGO='ed25519'
+
+# ASN.1/DER prefix that turns a raw 32-byte Ed25519 seed into a PKCS#8 PEM.
+# Only the trailing 32 seed bytes vary, so the header is constant:
+#   30 2e         SEQUENCE, len 0x2e (46) = whole PrivateKeyInfo
+#   02 01 00      INTEGER version = 0 (PKCS#8 v1)
+#   30 05         SEQUENCE, len 5      = AlgorithmIdentifier
+#   06 03 2b6570  OID 1.3.101.112      = Ed25519
+#   04 22         OCTET STRING len 34  = privateKey field
+#   04 20         OCTET STRING len 32  = inner CurvePrivateKey (your seed)
+CFG_DER_PRIV_HDR='302e020100300506032b657004220420'
+
+# ASN.1/DER prefix that turns a raw 32-byte Ed25519 public key into an SPKI PEM:
+#   30 2a         SEQUENCE, len 0x2a (42) = whole SubjectPublicKeyInfo
+#   30 05         SEQUENCE, len 5         = AlgorithmIdentifier
+#   06 03 2b6570  OID 1.3.101.112         = Ed25519
+#   03 21         BIT STRING, len 33
+#   00            0 unused bits (BIT STRING pad byte); your 32 pub bytes follow
+CFG_DER_PUB_HDR='302a300506032b6570032100'
+
+# Hash used to derive a stable Certificate CN from a public key, and how many
+# leading hex chars of that digest to keep. Trust is by pin, so the CN is just
+# a human-readable label - but both peers must agree on this scheme.
+CFG_CN_HASH='sha256sum'   # any coreutils *sum tool emitting "<hex>  -"
+CFG_CN_LEN=40             # number of leading hex characters to use as the CN
+
+# --- Certificates -----------------------------------------------------------
+
+# Validity of the generated identity / pin certs, in days. Cosmetic here:
+# trust is pinned by key, not by expiry, so this is deliberately long.
+CFG_CERT_DAYS=3650
+
+# Issuer name stamped on our identity cert. It only has to differ from the
+# subject (CN=<key hash>) and never appear in a peer's pin file - that makes the
+# cert NOT self-signed, so a verifying stunnel peer reports "unable to get local
+# issuer certificate" (which it tolerates, then matches us by pinned public key)
+# instead of "self-signed certificate" (which it rejects before that match can
+# run). See the identity-cert step below.
+CFG_LEAF_ISSUER='/CN=bktunnel-issuer'
+
+# --- Runtime / storage ------------------------------------------------------
+
+# Directory for ephemeral keys and certs. MUST be RAM-backed so private key
+# material never touches persistent storage (flash/disk). tmpfs default.
+CFG_RUNDIR_BASE='/dev/shm'
+
+# --- Default key files (ssh-style ~/.bktunnel) ------------------------------
+# Persistent, at-rest key locations that mirror ~/.ssh. Used only as fallbacks:
+#   -g with no FILE  -> offers to write the keypair here (interactive)
+#   -k omitted       -> read this host's private key from CFG_ID_FILE
+#   no -p passed     -> read pinned peer pubkeys from CFG_AUTH_FILE
+# Unlike the RAM material above, these DO live on disk; you opt into them.
+CFG_BK_DIR="${HOME:-}/.bktunnel"
+CFG_ID_FILE="$CFG_BK_DIR/id_ed25519"        # this host's private key
+CFG_PUB_FILE="$CFG_BK_DIR/id_ed25519.pub"   # this host's public key
+CFG_AUTH_FILE="$CFG_BK_DIR/authorized_keys" # pinned peer public keys
+
+# --- stunnel service --------------------------------------------------------
+
+# Service section name in the generated stunnel config (only shows up in logs).
+CFG_SVC_NAME='svc'
+
+# Run stunnel in the foreground (yes) - REQUIRED. We `exec` stunnel, so it
+# takes over this PID, and a detached watcher waits on that PID (tail --pid) to
+# shred the RAM keys once it dies. With "no", stunnel would daemonize: the
+# exec'd PID would exit immediately, so the watcher would shred the keys out
+# from under the still-running daemon. Leave as "yes".
+CFG_FOREGROUND='yes'
+
+# Require and verify the peer certificate against our pin file (mutual auth).
+# This is the entire point of the tool; "no" would disable pinning.
+CFG_VERIFY_PEER='yes'
+
+# --- User interaction -------------------------------------------------------
+
+# Prompt shown when a private key is expected on stdin AND stdin is an
+# interactive terminal (i.e. -k - / -k @- with no pipe). Printed to stderr.
+CFG_PRIVKEY_PROMPT='Paste private key (base64), then press Enter: '
+
+# ============================================================================
+# END HARDCODED CONFIGURATION
+# ============================================================================
+
+usage(){ cat <<USAGE
+Usage: bktunnel -r <client|server> -a <addr:port> -c <addr:port>
+                 [-k <privkey|-|@file>] [-p <pubkey|@file> ...]
+       bktunnel -g [file|-]   (generate a keypair; run too if opts given)
+
+Pinned-identity stunnel wrapper (${CFG_ALGO}, RAM-backed runtime keys).
+
+Required options:
+  -r ROLE     "client" or "server" (sets stunnel client = yes/no)
+  -a ADDR     accept  address:port  (local socket stunnel BINDS/listens on)
+              client: local plaintext in;  server: TLS in from peer
+  -c ADDR     connect address:port  (destination stunnel FORWARDS to)
+              client: TLS out to REMOTE peer;  server: LOCAL plaintext service
+  -p PUBKEY   the OTHER host's raw 32-byte public key, base64
+              -p @FILE reads pubkeys from FILE, one per line; blank lines and
+              '#' comments (whole-line or trailing) are ignored
+              repeat -p and/or mix literals with @FILE for multiple peers
+              (omit -p) read peers from the default authorized_keys (see below)
+
+Private key (THIS host's stable 32-byte Ed25519 private key, base64) - pick ONE:
+  -k PRIVKEY      pass the private key directly (visible in ps/history - avoid)
+  -k -            read the private key from stdin; prompts if stdin is a terminal
+  -k @FILE        read the private key from FILE (first line; a leading "privkey"
+                  label and/or a trailing '# ...' comment are accepted/stripped)
+  (omit -k)       read the default id_ed25519 (see below), else TUNNEL_PRIVKEY
+  (with -g)       -k is OPTIONAL and IGNORED: the generated private key is used
+
+Key generation:
+  -g [FILE]   generate a NEW ${CFG_ALGO} keypair, then exit (or run, see below):
+                -g FILE   write the private key to FILE (0600, '# privkey') and
+                          the public key to FILE.pub (0644, '# pubkey')
+                -g -      to a terminal, print two labelled lines (privkey then
+                          pubkey); when piped/redirected, print ONLY the bare
+                          private key (recover the pubkey later with -P)
+                -g        with no FILE at a terminal, prompt for a path (default
+                          id_ed25519) and write it + .pub; else act like -g -
+              If all OTHER required tunnel options are ALSO supplied, the tunnel
+              starts afterwards using the freshly generated private key as THIS
+              host's identity. The file-writing forms also print the 'pubkey'
+              line to stdout; hand it to the PEER for its -p.
+
+Default files (~/.bktunnel, ssh-style - used only as fallbacks):
+  private key (-k default):   $CFG_ID_FILE
+  public key  (written too):  $CFG_PUB_FILE
+  peer pins   (-p default):   $CFG_AUTH_FILE
+
+Other:
+  -P          derive this host's pubkey from its private key (-k / default file /
+              TUNNEL_PRIVKEY) and print the 'pubkey <base64>' line, then exit.
+              Recovers a lost pubkey; needs no -r/-a/-c/-p.
+  -h          show this help and exit
+
+Examples:
+  # generate a keypair; offer to save it to the default ~/.bktunnel/id_ed25519(.pub)
+  bktunnel -g
+
+  # generate a keypair to stdout and quit
+  bktunnel -g -
+
+  # generate into a chosen file pair (writes FILE and FILE.pub)
+  bktunnel -g ~/id_ed25519
+
+  # generate a FRESH identity and immediately run with it (peer still pinned)
+  bktunnel -g - -r client -a 127.0.0.1:5560 -c server:5560 -p "\$SERVER_PUBKEY"
+
+  # run entirely from the default files (-k id_ed25519, -p authorized_keys)
+  bktunnel -r client -a 127.0.0.1:5560 -c server:5560
+
+  # private key from a chosen file; one peer pinned
+  bktunnel -r server -a 0.0.0.0:5560 -c 127.0.0.1:1883 \\
+      -k @/etc/tunnel/id_ed25519 -p "\$CLIENT_PUBKEY"
+
+  # private key piped in on stdin
+  pass show client/privkey | bktunnel -r client -a 127.0.0.1:5560 \\
+      -c server:5560 -k - -p "\$SERVER_PUBKEY"
+
+  # private key from env (keeps it out of bktunnel's argv, unlike -k PRIVKEY)
+  export TUNNEL_PRIVKEY=...
+  bktunnel -r client -a 127.0.0.1:5560 -c server:5560 -p "\$SERVER_PUBKEY"
+USAGE
+}
+
+# gen_keypair: emit a fresh Ed25519 keypair as two base64 lines "privkey"/"pubkey".
+# The raw 32 bytes are sliced off the fixed-length DER (48-byte PKCS#8 private,
+# 44-byte SPKI public), matching the -k/-p key format used elsewhere here.
+gen_keypair(){
+  local der priv pub
+  der=$(openssl genpkey -algorithm "$CFG_ALGO" -outform DER | base64)
+  priv=$(base64 -d <<<"$der" | tail -c 32 | base64)
+  pub=$(base64 -d <<<"$der" | openssl pkey -inform DER -pubout -outform DER | tail -c 32 | base64)
+  printf 'privkey %s\npubkey  %s\n' "$priv" "$pub"
+}
+
+# gen_to_stdout: the "-g -" behavior. Labelled privkey+pubkey to a terminal
+# (human), or just the bare private key when piped/redirected (machine use).
+# Reads GEN_KP / GEN_PRIV set by the -g block below.
+gen_to_stdout(){
+  if [[ -t 1 ]]; then printf '%s\n' "$GEN_KP"; else printf '%s\n' "$GEN_PRIV"; fi
+}
+
+# confirm_overwrite FILE: succeed if FILE may be written - it's absent, or the
+# user agrees at a prompt. Refuses (never clobbers) when non-interactive.
+confirm_overwrite(){
+  local f=$1 ans=''
+  [[ -e $f ]] || return 0
+  [[ -t 0 ]] || { echo "error: $f already exists (refusing to overwrite non-interactively)" >&2; return 1; }
+  printf '%s already exists. Overwrite? [y/N] ' "$f" >&2
+  IFS= read -r ans || :
+  [[ $ans == [yY] || $ans == [yY][eE][sS] ]]
+}
+
+# write_keypair PRIV PUB PRIVFILE PUBFILE: ssh-keygen-style split write - the
+# private key (0600) with a "# privkey" comment and the public key (0644) with
+# a "# pubkey" comment, and echoes the shareable pubkey to stdout. Prompts
+# before overwriting the private key; that one yes covers the .pub too (it is
+# derivable, not a separate secret).
+write_keypair(){
+  local priv=$1 pub=$2 pf=$3 pubf=$4
+  confirm_overwrite "$pf" || return 1
+  rm -f -- "$pf" "$pubf"                          # create fresh: mode comes from umask, never a stale/loose one
+  ( umask 077; printf '%s # privkey\n' "$priv" > "$pf" )
+  ( umask 022; printf '%s # pubkey\n'  "$pub"  > "$pubf" )
+  printf 'private key written to %s\n' "$pf"   >&2
+  printf 'public key  written to %s\n' "$pubf" >&2
+  printf 'pubkey %s\n' "$pub"                     # shareable pubkey to stdout
+}
+
+# have_tunnel_opts: true only if enough was supplied to actually run the tunnel.
+# (In the -g path the private key is always satisfied - it's the generated one.)
+have_tunnel_opts(){
+  [[ -n $ROLE && -n $ACCEPT && -n $CONNECT ]] || return 1
+  (( KEY_SET )) || [[ -n ${TUNNEL_PRIVKEY:-} ]] || return 1
+  (( ${#PEER_PUBS[@]} > 0 )) || return 1
+  return 0
+}
+
+# --- parse CLI ---
+ROLE='' ACCEPT='' CONNECT=''
+MY_PRIV=''; KEY_SET=0
+GEN_OUT=''; GEN_SET=0; GEN_HASOUT=0
+PUBKEY_ONLY=0
+PEER_PUBS=()
+while getopts ':r:a:c:k:p:ghP' opt; do
+  case "$opt" in
+    r) ROLE=$OPTARG ;;
+    a) ACCEPT=$OPTARG ;;
+    c) CONNECT=$OPTARG ;;
+    k) MY_PRIV=$OPTARG; KEY_SET=1 ;;
+    g) GEN_SET=1; GEN_OUT=''; GEN_HASOUT=0
+       # -g takes an OPTIONAL argument. getopts can't express that, so peek at
+       # the next token and consume it as the destination unless it's absent or
+       # looks like another option. A lone '-' means stdout and IS consumed.
+       if (( OPTIND <= $# )); then
+         gnext=${!OPTIND}
+         if [[ $gnext == '-' || $gnext != -* ]]; then
+           GEN_OUT=$gnext; GEN_HASOUT=1; OPTIND=$((OPTIND + 1))
+         fi
+       fi ;;
+    P) PUBKEY_ONLY=1 ;;
+    p) case "$OPTARG" in
+         @*) f=${OPTARG#@}                        # strip leading '@'
+             [[ -r $f ]] || { echo "error: cannot read pubkey file: $f" >&2; exit 2; }
+             # one base64 pubkey per line; blank lines and '#' comment lines
+             # skipped; last line need not end in a newline (|| [[ -n $line ]])
+             while IFS= read -r line || [[ -n $line ]]; do
+               line=${line%%#*}                   # strip trailing/whole-line comments
+               line=${line#"${line%%[![:space:]]*}"}   # trim leading whitespace
+               line=${line%"${line##*[![:space:]]}"}   # trim trailing whitespace
+               [[ -n $line ]] || continue         # skip blank / comment-only lines
+               PEER_PUBS+=("$line")
+             done < "$f" ;;
+         *)  PEER_PUBS+=("$OPTARG") ;;            # literal pubkey
+       esac ;;
+    h) usage; exit 0 ;;
+    :) echo "error: -$OPTARG requires an argument" >&2; usage >&2; exit 2 ;;
+    \?) echo "error: unknown option -$OPTARG" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+# Default peer pins: if no -p was passed, fall back to ~/.bktunnel/authorized_keys
+# (same one-pubkey-per-line, '#'-comment format as -p @FILE).
+if (( ${#PEER_PUBS[@]} == 0 )) && [[ -r $CFG_AUTH_FILE ]]; then
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%%#*}
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
+    [[ -n $line ]] || continue
+    PEER_PUBS+=("$line")
+  done < "$CFG_AUTH_FILE"
+fi
+
+# --- key generation (runs before private key resolution) ---
+if (( GEN_SET )); then
+  GEN_KP=$(gen_keypair)                          # "privkey <b64>\npubkey  <b64>"
+  GEN_PRIV=${GEN_KP%%$'\n'*}; GEN_PRIV=${GEN_PRIV#privkey }   # bare private key
+  GEN_PUB=${GEN_KP#*$'\n'}; GEN_PUB=${GEN_PUB#pubkey}         # drop label ...
+  GEN_PUB=${GEN_PUB#"${GEN_PUB%%[![:space:]]*}"}             # ... and spaces -> bare pubkey
+
+  if (( GEN_HASOUT )); then
+    if [[ $GEN_OUT == - ]]; then
+      gen_to_stdout                              # explicit stdout
+    else
+      write_keypair "$GEN_PRIV" "$GEN_PUB" "$GEN_OUT" "$GEN_OUT.pub" || exit 1
+    fi
+  elif [[ -t 0 ]]; then
+    # -g with no destination, interactive: ask where to save (ssh-keygen style),
+    # defaulting to ~/.bktunnel/id_ed25519; Enter accepts the default.
+    [[ -n ${HOME:-} ]] || { echo "error: \$HOME is not set; cannot use $CFG_ID_FILE" >&2; exit 2; }
+    printf 'Enter file in which to save the key (%s): ' "$CFG_ID_FILE" >&2
+    ans=''; IFS= read -r ans || :
+    gpf=${ans:-$CFG_ID_FILE}                       # empty -> default
+    [[ $gpf == '~' || $gpf == '~/'* ]] && gpf="${HOME}${gpf#\~}"   # expand leading ~
+    gdir=$(dirname -- "$gpf")
+    mkdir -p -m 0700 -- "$gdir"
+    [[ $gdir == "$CFG_BK_DIR" ]] && chmod 0700 -- "$CFG_BK_DIR"   # tighten our own dir if it pre-existed loose
+    write_keypair "$GEN_PRIV" "$GEN_PUB" "$gpf" "$gpf.pub" || exit 1
+  else
+    gen_to_stdout                                # no destination, non-interactive: behave as -g -
+  fi
+
+  # AUTO-USE the fresh private key as THIS host's identity; -k, if any, loses.
+  (( KEY_SET )) && echo "warning: -k ignored; using the freshly generated private key" >&2
+  MY_PRIV=$GEN_PRIV
+  KEY_SET=1
+
+  # start the tunnel only if the remaining required opts are present
+  have_tunnel_opts || exit 0
+fi
+
+# read the private key from stdin; if stdin is a tty, prompt for it silently first
+read_privkey_stdin(){
+  if [[ -t 0 ]]; then
+    printf '%s' "$CFG_PRIVKEY_PROMPT" >&2
+    IFS= read -rs MY_PRIV || :                   # || : : EOF w/o trailing newline still sets MY_PRIV
+    printf '\n' >&2                              # newline the silent read swallowed
+  else
+    IFS= read -r MY_PRIV || :
+  fi
+}
+
+# --- resolve the private key from exactly one source ---
+if (( KEY_SET )); then
+  case "$MY_PRIV" in
+    -|@-) read_privkey_stdin ;;                  # stdin (prompts if a terminal)
+    @*)  f=${MY_PRIV#@}                          # strip leading '@'
+         [[ -r $f ]] || { echo "error: cannot read private key file: $f" >&2; exit 2; }
+         IFS= read -r MY_PRIV < "$f" || : ;;     # from file (first line)
+    *)   : ;;                                    # literal value (incl. generated)
+  esac
+elif [[ -r $CFG_ID_FILE ]]; then
+  IFS= read -r MY_PRIV < "$CFG_ID_FILE" || :     # default identity (first line)
+elif [[ -n ${TUNNEL_PRIVKEY:-} ]]; then
+  MY_PRIV=$TUNNEL_PRIVKEY
+fi
+
+# Normalize: accept a bare base64 key, the labelled "privkey <b64>" line that -g
+# once wrote, or the "<b64> # privkey" line ~/.bktunnel/id_ed25519 now holds, so
+# every form round-trips through -k @FILE / the default identity file.
+MY_PRIV=${MY_PRIV%%#*}                            # strip trailing '#...' comment
+MY_PRIV=${MY_PRIV#"${MY_PRIV%%[![:space:]]*}"}   # trim leading whitespace
+MY_PRIV=${MY_PRIV%"${MY_PRIV##*[![:space:]]}"}   # trim trailing whitespace
+if [[ $MY_PRIV == privkey[[:space:]]* ]]; then
+  MY_PRIV=${MY_PRIV#privkey}                     # drop the label ...
+  MY_PRIV=${MY_PRIV#"${MY_PRIV%%[![:space:]]*}"} # ... and the space after it
+fi
+
+# --- print pubkey and exit (-P) ---
+# Ed25519's public key derives from the seed, so recover it from the private key.
+if (( PUBKEY_ONLY )); then
+  [[ -n $MY_PRIV ]] || { echo "error: no private key provided" >&2; exit 2; }
+  pub=$({ printf '%s' "$CFG_DER_PRIV_HDR"|xxd -r -p; base64 -d <<<"$MY_PRIV"; } \
+        | openssl pkey -inform DER -pubout -outform DER | tail -c 32 | base64)
+  printf 'pubkey %s\n' "$pub"
+  exit 0
+fi
+
+# --- validate ---
+case "$ROLE" in
+  client) CLIENT=yes ;;
+  server) CLIENT=no  ;;
+  *) echo "error: -r must be 'client' or 'server'" >&2; exit 2 ;;
+esac
+[[ -n $ACCEPT  ]] || { echo "error: -a (accept) is required"  >&2; exit 2; }
+[[ -n $CONNECT ]] || { echo "error: -c (connect) is required" >&2; exit 2; }
+[[ -n $MY_PRIV ]] || { echo "error: no private key provided" >&2; exit 2; }
+(( ${#PEER_PUBS[@]} > 0 )) || { echo "error: at least one -p (peer pub) is required" >&2; exit 2; }
+
+RUN=$(mktemp -d -p "$CFG_RUNDIR_BASE")       # RAM-backed: never touches flash
+# Until we `exec stunnel` below, shred the RAM key material on any exit - e.g.
+# an openssl failure under `set -e`, or Ctrl-C during setup. Once stunnel is
+# running it takes over this PID and a detached watcher handles cleanup (see
+# below), because exec discards these traps.
+trap 'shred -u "$RUN"/* 2>/dev/null || :; rm -rf "$RUN" || :' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# unpriv: raw 32-byte seed (base64) -> PKCS#8 PEM private key
+unpriv(){ { printf '%s' "$CFG_DER_PRIV_HDR"|xxd -r -p; base64 -d; } | openssl pkey -inform DER; }
+
+# unpub: raw 32-byte public key (base64) -> SubjectPublicKeyInfo PEM
+unpub(){  { printf '%s' "$CFG_DER_PUB_HDR"|xxd -r -p; base64 -d; } | openssl pkey -pubin -inform DER; }
+
+# cn: derive a stable CN from a public key (leading hex of its digest)
+cn(){ openssl pkey -pubin -outform DER | "$CFG_CN_HASH" | cut -c1-"$CFG_CN_LEN"; }
+
+# --- our STABLE identity key + pinnable cert ---
+# 0600: the RUN dir is already 0700, but stunnel also checks the key file's own
+# mode and warns ("Insecure file permissions") if group/other can read it.
+( umask 077; unpriv <<<"$MY_PRIV" > "$RUN/node.key" )
+MYCN=$(openssl pkey -in "$RUN/node.key" -pubout | cn)
+# The cert carries our public key under CN=$MYCN so the peer can pin it, and is
+# deliberately NOT self-signed (see CFG_LEAF_ISSUER): we sign it with our own key
+# but stamp a different issuer NAME, so the peer's stunnel reports "unable to get
+# local issuer certificate" (tolerated, then it matches us by pinned public key)
+# rather than "self-signed certificate" (rejected before that match). The
+# throwaway issuer cert only signs node.crt; it is never sent to the peer.
+openssl req -x509 -new -key "$RUN/node.key" -days "$CFG_CERT_DAYS" \
+  -subj "$CFG_LEAF_ISSUER" -out "$RUN/issuer.crt"
+openssl req -new -key "$RUN/node.key" -subj "/CN=$MYCN" \
+  | openssl x509 -req -CA "$RUN/issuer.crt" -CAkey "$RUN/node.key" \
+      -CAcreateserial -days "$CFG_CERT_DAYS" -out "$RUN/node.crt"
+
+# --- throwaway signer + one pin-cert per peer pubkey ---
+# Each pin is a cert CARRYING the peer's pubkey, signed by a throwaway key. We
+# build it as CSR -> x509 -req -force_pubkey: '-force_pubkey' lives in 'openssl
+# x509' (OpenSSL 1.1.1 and 3.x); it was NOT accepted by 'openssl req' on 3.x.
+openssl genpkey -algorithm "$CFG_ALGO" -out "$RUN/junk.key"
+: > "$RUN/pins.pem"
+for p in "${PEER_PUBS[@]}"; do
+  unpub <<<"$p" > "$RUN/peer.pub"
+  PCN=$(cn < "$RUN/peer.pub")
+  openssl req -new -key "$RUN/junk.key" -subj "/CN=$PCN" \
+    | openssl x509 -req -signkey "$RUN/junk.key" -force_pubkey "$RUN/peer.pub" \
+          -days "$CFG_CERT_DAYS" >> "$RUN/pins.pem"
+done
+
+# Write the config to a real file in the RAM dir. Passing it via /dev/stdin
+# fails on stunnel builds that canonicalize the config path with realpath(3):
+# the here-doc is an unlinked temp file, so realpath() ENOENTs on it.
+cat > "$RUN/stunnel.conf" <<EOF
+foreground = $CFG_FOREGROUND
+pid =
+[$CFG_SVC_NAME]
+client  = $CLIENT
+accept  = $ACCEPT
+connect = $CONNECT
+cert    = $RUN/node.crt
+key     = $RUN/node.key
+verifyPeer = $CFG_VERIFY_PEER
+CAfile  = $RUN/pins.pem
+EOF
+
+# Spawn a detached watcher, then REPLACE this shell with stunnel via exec. Why
+# exec: the process a supervisor (systemd, the test harness, an interactive
+# shell) signals is then stunnel itself, so SIGTERM/SIGKILL to our PID stops the
+# tunnel directly - no orphaned child left holding pipes open. exec discards our
+# EXIT trap, though, so the watcher below takes over cleanup: it waits for our
+# PID to die - tail --pid works on a non-child - and shreds the RAM keys, even
+# under SIGKILL, which no in-shell trap could catch. Its stdio goes to /dev/null
+# so it never keeps our stdin/stdout/stderr open (that would stall a parent
+# reading our output until the watcher, not just stunnel, had exited).
+( trap '' INT TERM
+  tail --pid=$$ -f /dev/null 2>/dev/null
+  shred -u "$RUN"/* 2>/dev/null || :
+  rm -rf "$RUN" || :
+) </dev/null >/dev/null 2>&1 &
+exec stunnel "$RUN/stunnel.conf"

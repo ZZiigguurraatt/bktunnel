@@ -113,7 +113,7 @@ func decodePub(b64 string) (ed25519.PublicKey, error) {
 // rejecting a self-signed leaf outright. We still sign with our own key; only
 // the issuer NAME differs from the subject (a self-signed cert sets them equal).
 func identityCert(priv ed25519.PrivateKey) (tls.Certificate, error) {
-	der, err := certDER(priv, false)
+	der, err := certDER(priv)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
@@ -121,18 +121,21 @@ func identityCert(priv ed25519.PrivateKey) (tls.Certificate, error) {
 }
 
 // certDER mints an X.509 certificate over the identity key and returns its DER
-// bytes. The subject CN is sha256(SPKI)[:40] (the bash tool's key-hash scheme)
-// and the key does its own signing, whichever issuer name is stamped.
+// bytes. It is deliberately NOT self-signed: the subject CN is sha256(SPKI)[:40]
+// (the bash tool's key-hash scheme) while the issuer NAME is leafIssuerCN,
+// distinct from the subject, so a verifying stunnel peer treats it as "issuer
+// not found" (tolerated) rather than rejecting a self-signed leaf outright. The
+// key still does its own signing; only the stamped issuer name differs.
 //
-// selfSigned picks that issuer name. false is the wire form identityCert
-// presents: the issuer is leafIssuerCN, distinct from the subject, so a
-// verifying stunnel peer treats us as "issuer not found" (tolerated) rather than
-// rejecting a self-signed leaf outright. true makes a plain self-signed cert
-// (issuer == subject) — the form standalone tools (curl, openssl s_client) and
-// browser cert stores expect when a cert is imported directly rather than
-// chained. bktunnel's own pin check reads only the leaf's public key, so both
-// forms authenticate identically to a bktunnel peer.
-func certDER(priv ed25519.PrivateKey, selfSigned bool) ([]byte, error) {
+// Both the on-wire carrier cert (identityCert) and the exported --pem cert
+// (writeCertPEM) use this same form. That matters for --pem: a self-signed leaf
+// is rejected by a bktunnel *server* backed by stunnel ("self-signed
+// certificate"), so an exported cert must carry the distinct issuer to
+// authenticate against every bktunnel server — Go, bash/stunnel, and Python
+// alike — not just the Go one (whose pin check ignores the issuer). Standalone
+// clients (curl, openssl s_client) present the cert regardless of its issuer, so
+// the distinct-issuer form costs them nothing.
+func certDER(priv ed25519.PrivateKey) ([]byte, error) {
 	pub := priv.Public().(ed25519.PublicKey)
 	spki, err := x509.MarshalPKIXPublicKey(pub)
 	if err != nil {
@@ -149,9 +152,6 @@ func certDER(priv ed25519.PrivateKey, selfSigned bool) ([]byte, error) {
 	}
 	// parent supplies only the issuer name; priv (our key) does the signing.
 	issuer := &x509.Certificate{Subject: pkix.Name{CommonName: leafIssuerCN}}
-	if selfSigned {
-		issuer = leaf // issuer == subject: a conventional self-signed cert
-	}
 	return x509.CreateCertificate(rand.Reader, leaf, issuer, pub, priv)
 }
 
@@ -442,15 +442,17 @@ func writeKeypair(file string, priv ed25519.PrivateKey, seedB64, pubB64 string, 
 	return nil
 }
 
-// writeCertPEM writes a self-signed PEM certificate to certFile (0644) and its
-// PKCS#8 private key to keyFile (0600). Together they let an OpenSSL-family
-// client (curl --cert/--key, openssl s_client, most language TLS stacks) connect
+// writeCertPEM writes a PEM certificate to certFile (0644) and its PKCS#8
+// private key to keyFile (0600). Together they let an OpenSSL-family client
+// (curl --cert/--key, openssl s_client, most language TLS stacks) connect
 // straight to a bktunnel server without running the bktunnel proxy: the server
 // pins the bare public key, which is identical to the base64 key files, so these
-// authenticate the same identity. The caller has already confirmed any overwrite
-// of the private key (these files are derived from it), so this does not prompt.
+// authenticate the same identity. The cert uses the same distinct-issuer form as
+// the on-wire cert (see certDER) so it is accepted by every bktunnel server, not
+// just the Go one. The caller has already confirmed any overwrite of the private
+// key (these files are derived from it), so this does not prompt.
 func writeCertPEM(certFile, keyFile string, priv ed25519.PrivateKey) error {
-	der, err := certDER(priv, true)
+	der, err := certDER(priv)
 	if err != nil {
 		return err
 	}

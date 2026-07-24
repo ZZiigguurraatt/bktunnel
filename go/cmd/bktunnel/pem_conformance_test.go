@@ -14,6 +14,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
 	"os"
 	"os/exec"
@@ -104,4 +105,39 @@ func TestConformancePEMPythonClient(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("python stdlib-ssl client with --pem cert: %v\n%s", lastErr, lastOut)
+}
+
+// TestConformancePEMCertPythonServer proves a --pem cert authenticates against a
+// bktunnel server run by the Python conformance implementation, not just the Go
+// server — the server-side mirror of the bash-server interop test.
+func TestConformancePEMCertPythonServer(t *testing.T) {
+	requirePython(t)
+	py := pythonScript(t)
+	goBin := buildGoBinary(t)
+	backend := startEcho(t)
+	sPriv, _ := genKeypair(t, goBin)
+	cPub, certFile, keyFile := genKeypairPEM(t, goBin)
+
+	tlsAddr := freePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	// Python bktunnel server pins the client's --pem pubkey.
+	startProc(t, ctx, "python3", py,
+		"-r", "server", "-a", tlsAddr, "-c", backend, "-k", "@"+writeKey(t, sPriv), "-p", cPub)
+
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		t.Fatalf("load PEM keypair: %v", err)
+	}
+	// Present the cert unconditionally (as curl/openssl do); the Python server
+	// sends acceptable-CA names, which Go's default Certificates selection would
+	// filter against — see the bash-server test for the same workaround.
+	cfg := &tls.Config{
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &cert, nil },
+		InsecureSkipVerify:   true,
+		MinVersion:           tls.VersionTLS12,
+	}
+	if err := tryRoundTripTLS(tlsAddr, cfg, 20*time.Second); err != nil {
+		t.Fatalf("stock TLS client with --pem cert -> python server: %v", err)
+	}
 }

@@ -147,6 +147,43 @@ func TestInteropPEMBashCert(t *testing.T) {
 	}
 }
 
+// TestInteropPEMCertBashServer proves a --pem cert authenticates against a
+// bktunnel *server* run by the bash/stunnel implementation, not just the Go
+// server. stunnel rejects a self-signed leaf outright, so this is the test that
+// catches a regression to a self-signed exported cert (the distinct-issuer form
+// is what makes it work here).
+func TestInteropPEMCertBashServer(t *testing.T) {
+	script := requireInteropDeps(t)
+	goBin := buildGoBinary(t)
+	backend := startEcho(t)
+	sPriv, _ := genKeypair(t, goBin)
+	cPub, certFile, keyFile := genKeypairPEM(t, goBin)
+
+	tlsAddr := freePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	// bash/stunnel server pins the client's --pem pubkey.
+	startProc(t, ctx, "bash", script,
+		"-r", "server", "-a", tlsAddr, "-c", backend, "-k", "@"+writeKey(t, sPriv), "-p", cPub)
+
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		t.Fatalf("load PEM keypair: %v", err)
+	}
+	// Present the cert unconditionally (as curl/openssl do). A bktunnel server
+	// backed by stunnel sends acceptable-CA names in its CertificateRequest; Go's
+	// default Certificates selection would filter our cert out (issuer doesn't
+	// match) and send none — the same quirk the bktunnel client works around.
+	cfg := &tls.Config{
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &cert, nil },
+		InsecureSkipVerify:   true,
+		MinVersion:           tls.VersionTLS12,
+	}
+	if err := tryRoundTripTLS(tlsAddr, cfg, 15*time.Second); err != nil {
+		t.Fatalf("stock TLS client with --pem cert -> bash/stunnel server: %v", err)
+	}
+}
+
 // TestGoPEMStockServer proves the other direction the README
 // documents: the --pem files serve just as well as a stock TLS *server's*
 // certificate. A plain crypto/tls listener (NOT the bktunnel server role) loads

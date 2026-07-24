@@ -218,22 +218,33 @@ confirm_overwrite(){
 }
 
 # write_cert_pem PRIV CERTFILE KEYFILE: from a raw base64 seed, write the PKCS#8
-# PEM private key to KEYFILE (0600) and a self-signed PEM certificate over it to
-# CERTFILE (0644). These let an OpenSSL-family client (curl --cert/--key, openssl
+# PEM private key to KEYFILE (0600) and a PEM certificate over it to CERTFILE
+# (0644). These let an OpenSSL-family client (curl --cert/--key, openssl
 # s_client) or a stock TLS server use the bktunnel identity WITHOUT running the
 # proxy: the peer still pins the bare public key, identical across all the files.
-# Unlike the runtime node.crt this cert IS self-signed (issuer == subject = the
-# key-hash CN) - that is the plain form standalone tools expect when a cert is
-# handed to them directly rather than chained. The caller has already confirmed
-# any overwrite of the private key (these are derived from it), so no prompt.
+# The cert uses the SAME non-self-signed form as the runtime node.crt (subject
+# CN=<key hash>, issuer CFG_LEAF_ISSUER, signed by our own key): a self-signed
+# leaf is rejected outright by a bktunnel server backed by stunnel ("self-signed
+# certificate"), whereas the distinct issuer is tolerated ("issuer not found"),
+# so the exported cert authenticates against every bktunnel server, not just the
+# Go one. Standalone clients present the cert regardless of its issuer. The
+# caller has already confirmed any overwrite of the private key, so no prompt.
 write_cert_pem(){
-  local priv=$1 certf=$2 keyf=$3 mycn
+  local priv=$1 certf=$2 keyf=$3 mycn tmpd
   rm -f -- "$certf" "$keyf"                        # create fresh: mode from umask
   ( umask 077; { printf '%s' "$CFG_DER_PRIV_HDR"|xxd -r -p; base64 -d <<<"$priv"; } \
       | openssl pkey -inform DER > "$keyf" )
   mycn=$(openssl pkey -in "$keyf" -pubout -outform DER | "$CFG_CN_HASH" | cut -c1-"$CFG_CN_LEN")
-  ( umask 022; openssl req -x509 -new -key "$keyf" -days "$CFG_CERT_DAYS" \
-      -subj "/CN=$mycn" -out "$certf" )
+  # Mint a throwaway issuer cert (CN=CFG_LEAF_ISSUER) and sign our subject under
+  # it, so the leaf is NOT self-signed - issuer NAME differs from subject, same
+  # as node.crt. Our own key signs; the issuer key is discarded with tmpd.
+  tmpd=$(mktemp -d)
+  openssl req -x509 -new -key "$keyf" -days "$CFG_CERT_DAYS" \
+    -subj "$CFG_LEAF_ISSUER" -out "$tmpd/issuer.crt" 2>/dev/null
+  ( umask 022; openssl req -new -key "$keyf" -subj "/CN=$mycn" 2>/dev/null \
+      | openssl x509 -req -CA "$tmpd/issuer.crt" -CAkey "$keyf" -CAcreateserial \
+          -days "$CFG_CERT_DAYS" -out "$certf" 2>/dev/null )
+  rm -rf -- "$tmpd"
   printf 'certificate written to %s\n' "$certf" >&2
   printf 'cert key    written to %s\n' "$keyf"  >&2
 }

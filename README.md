@@ -1153,6 +1153,88 @@ fails, so nothing reaches the far `nc`.
 > `netcat-openbsd`, and macOS): `-l host port` to listen, `-N` to half-close on
 > EOF. GNU `netcat` spells them `-l -p port` and `-q 0`.
 
+## Trust models: who authenticates whom
+
+With `bktunnel` running on **both** ends, its default is **mutual** authentication
+— each side pins the other with the `-p` option, or the default
+`authorized_keys` file. But the pieces (each side's pin, and the [`--pem`](#standalone-client-cert---pem)
+files that let a stock tool stand in for a proxy) also let you build one-way
+arrangements on purpose. What a party gains is confidence that there is **no
+man-in-the-middle (MITM)** on the connection. Who gets that confidence depends
+on who authenticates whom.
+
+| Who authenticates whom | Client sure: no MITM? | Server sure: no MITM? | What breaks it | Notes |
+|---|---|---|---|---|
+| **Mutual** — each authenticates the other | ✅ Yes | ✅ Yes | **Pinned:** either side's private key is leaked. **CA-signed:** additionally, any one rogue/compromised CA can forge either identity. | Neither side trusts the other to authenticate; **both** have data to lose. |
+| **Client authenticates server** only | ✅ Yes | ❌ No | **Pinned:** the server's private key is leaked. **CA-signed:** additionally, any one rogue/compromised CA. | The server can't tell the client from an interposer. Because the client is the sole authenticator, any MITM-exposable data is treated as the **client's** risk, not the server's. Normal web browsing is the CA-signed instance of this case. |
+| **Client authenticates server + shared secret — unknown client** | ✅ Yes | ❌ No | **Pinned:** the server's private key is leaked. **CA-signed:** additionally, any one rogue/compromised CA. **Either variant:** a leaked password lets someone pose as the client. | Normal web login. The server can't assume an arbitrary client verified it, so it can't conclude no-MITM — and thus can't confirm its peer is the client rather than an impostor; MITM-exposable data is the **client's** risk. |
+| **Client authenticates server + shared secret — known client** | ✅ Yes | ✅ Implicitly, if it trusts the client authenticates the server | **Pinned:** the server's private key is leaked. **CA-signed:** additionally, any one rogue/compromised CA. **Either variant:** a leaked password lets someone pose as the client. | The server trusts this known client pins it (blocking a relaying MITM), so a valid password implies a direct connection ⇒ no MITM. |
+| **Server authenticates client** only | ❌ No | ✅ Yes | **Pinned:** the client's private key is leaked. **CA-signed:** additionally, any one rogue/compromised CA. | Server needs to know the far end is the real client. |
+| **Server authenticates client + shared secret — unknown server** | ❌ No | ✅ Yes | **Pinned:** the client's private key is leaked. **CA-signed:** additionally, any one rogue/compromised CA. **Either variant:** a leaked secret lets an impostor server fool the client. | Without trusting the server's behavior, the client can't rule out a relay obtaining the secret from the server, so recognizing it confirms neither no-MITM nor that its peer is the real server rather than an impostor. |
+| **Server authenticates client + shared secret — known server** | ✅ Implicitly, if it trusts the server authenticates clients | ✅ Yes | **Pinned:** the client's private key is leaked. **CA-signed:** additionally, any one rogue/compromised CA. **Either variant:** a leaked secret lets an impostor server fool the client. | The client trusts this known server reveals the secret only to the authenticated client (blocking a relay), so verifying the secret gives **implicit** no-MITM without pinning the server. |
+
+**Mutual — both sides authenticate each other.** Each end pins the other's
+public key, so each authenticates the other and — because a MITM can present
+neither pinned key — **both** ends have confidence there is no MITM. Use this
+when neither side trusts the other to authenticate and **both** stand to lose if
+their data is exposed to a MITM. This is the default when both ends run with
+`-p` set.
+
+**Client authenticates the server only.** The client pins the server; the server
+does not pin the client. The **client** knows there is no MITM — it reached the
+exact server it pinned. The **server does not**: it cannot tell whether the bytes
+arrived straight from the client or through an interposer. This is the model of
+**normal web browsing**: your browser authenticates the website (there, via a
+CA-signed certificate rather than a pin) while the site does not authenticate
+your browser at the TLS layer.
+
+Note that trusting CA-signed certificates instead of pinning is **weaker** than
+a pin. It requires trusting **every** CA in the browser's root store to be
+honest and uncompromised — the guarantee is only as strong as the *least*
+trustworthy CA. If at any time **one** CA anywhere in the world is breached,
+coerced, or goes rogue, it can mint a valid-looking certificate for your server,
+and the client will accept the MITM presenting it — the whole trust chain breaks
+on that single failure. A pin trusts exactly one key, so it has no such weak
+link.
+
+**Client authenticates the server, plus a shared secret.** As above, the client
+pins the server, and additionally hands the server a shared secret (e.g. a
+password). What the server gains depends on whether the client is **known** to
+it. For an **unknown** client (normal web login), a valid password proves only
+that the real client's secret entered the chain — not that the server's actual
+peer *is* the client. Unable to rule out a MITM, the server can't exclude that
+its peer is an impostor that relayed or replayed the password, so it confirms
+neither no-MITM nor identity, and treats any MITM-exposable data as the
+**client's** risk. For a **known** client — one the
+server trusts, out of band, to pin the server — the server gains **implicit**
+no-MITM assurance: because that client would refuse a server it can't verify, a
+relaying MITM can't sit between them, so a valid password implies a direct
+connection.
+
+**Server authenticates the client only.** The server pins the client; the client
+does not pin the server. The **server** knows there is no MITM — the far end
+proved possession of the pinned key. The **client does not** get that assurance
+from the protocol: authenticating *itself* to the far end says nothing about
+*who* the far end is, so an impostor server could sit in front of the client
+undetected. For the client to gain assurance, the server must prove itself to the
+client too — the next case.
+
+**Server authenticates the client, plus a shared secret.** The mirror of the
+case above, with roles swapped: the server pins the client and presents it a
+pre-shared secret (e.g. an anti-phishing phrase) only the real server knows. What
+the client gains depends on whether the server is **known** to it. For a **known** server —
+one the client trusts, out of band (e.g. it physically owns the server), to
+reveal the secret only to the authenticated client — verifying the secret gives
+**implicit** no-MITM assurance without ever pinning the server: a terminating
+impostor never had the secret, and a relaying one can't authenticate as the
+pinned client to obtain it. For an **unknown** server the client has no such
+trust — it can't rule out that a relay obtained the secret — so seeing the
+correct secret proves neither no-MITM nor the server's identity: its peer could
+be an impostor relaying the genuine secret. Both ingredients are load-bearing: without the
+secret a terminating impostor fools the client; without the server authenticating
+the client (and the client trusting that it does) a relaying impostor can obtain
+the secret.
+
 ## Security notes
 
 - Prefer `-k @FILE` (permissions `0600`, owner-only) or `TUNNEL_PRIVKEY` over a

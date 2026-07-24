@@ -28,6 +28,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -112,10 +113,30 @@ func decodePub(b64 string) (ed25519.PublicKey, error) {
 // rejecting a self-signed leaf outright. We still sign with our own key; only
 // the issuer NAME differs from the subject (a self-signed cert sets them equal).
 func identityCert(priv ed25519.PrivateKey) (tls.Certificate, error) {
+	der, err := certDER(priv, false)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}, nil
+}
+
+// certDER mints an X.509 certificate over the identity key and returns its DER
+// bytes. The subject CN is sha256(SPKI)[:40] (the bash tool's key-hash scheme)
+// and the key does its own signing, whichever issuer name is stamped.
+//
+// selfSigned picks that issuer name. false is the wire form identityCert
+// presents: the issuer is leafIssuerCN, distinct from the subject, so a
+// verifying stunnel peer treats us as "issuer not found" (tolerated) rather than
+// rejecting a self-signed leaf outright. true makes a plain self-signed cert
+// (issuer == subject) — the form standalone tools (curl, openssl s_client) and
+// browser cert stores expect when a cert is imported directly rather than
+// chained. bktunnel's own pin check reads only the leaf's public key, so both
+// forms authenticate identically to a bktunnel peer.
+func certDER(priv ed25519.PrivateKey, selfSigned bool) ([]byte, error) {
 	pub := priv.Public().(ed25519.PublicKey)
 	spki, err := x509.MarshalPKIXPublicKey(pub)
 	if err != nil {
-		return tls.Certificate{}, err
+		return nil, err
 	}
 	sum := sha256.Sum256(spki)
 	cn := hex.EncodeToString(sum[:])[:40]
@@ -128,11 +149,10 @@ func identityCert(priv ed25519.PrivateKey) (tls.Certificate, error) {
 	}
 	// parent supplies only the issuer name; priv (our key) does the signing.
 	issuer := &x509.Certificate{Subject: pkix.Name{CommonName: leafIssuerCN}}
-	der, err := x509.CreateCertificate(rand.Reader, leaf, issuer, pub, priv)
-	if err != nil {
-		return tls.Certificate{}, err
+	if selfSigned {
+		issuer = leaf // issuer == subject: a conventional self-signed cert
 	}
-	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}, nil
+	return x509.CreateCertificate(rand.Reader, leaf, issuer, pub, priv)
 }
 
 // ---- pinning ----
@@ -327,6 +347,15 @@ func genToStdout(seedB64, pubB64 string) {
 	}
 }
 
+// warnPEMToStdout notes that --pem has no effect when the key goes to stdout:
+// the PEM cert/key are written next to a destination file, and there is no file
+// when generating to stdout.
+func warnPEMToStdout(pemOut bool) {
+	if pemOut {
+		log.Println("warning: --pem ignored when generating to stdout (needs a file destination)")
+	}
+}
+
 // stdinReader is a single shared reader over os.Stdin so consecutive prompts
 // don't lose input to a per-call bufio.Reader that buffered past its line.
 var stdinReader = bufio.NewReader(os.Stdin)
@@ -379,10 +408,11 @@ func confirmOverwrite(path string) error {
 
 // writeKeypair writes the private key to file (0600, "<b64> # privkey") and the
 // public key to file+".pub" (0644, "<b64> # pubkey"), ssh-keygen style, and
-// echoes the shareable pubkey to stdout. It prompts before overwriting the
-// private key; that one yes covers the .pub too (it is derivable, not a
-// separate secret).
-func writeKeypair(file, seedB64, pubB64 string) error {
+// echoes the shareable pubkey to stdout. When emitCert is set it also writes a
+// PEM cert/key pair (see writeCertPEM). It prompts before overwriting the
+// private key; that one yes covers the .pub, .crt and .key too (all are
+// derivable from the private key, not separate secrets).
+func writeKeypair(file string, priv ed25519.PrivateKey, seedB64, pubB64 string, emitCert bool) error {
 	pubFile := file + ".pub"
 	if err := confirmOverwrite(file); err != nil {
 		return err
@@ -403,7 +433,46 @@ func writeKeypair(file, seedB64, pubB64 string) error {
 	}
 	fmt.Fprintf(os.Stderr, "private key written to %s\n", file)
 	fmt.Fprintf(os.Stderr, "public key  written to %s\n", pubFile)
+	if emitCert {
+		if err := writeCertPEM(file+".crt", file+".key", priv); err != nil {
+			return err
+		}
+	}
 	fmt.Printf("pubkey %s\n", pubB64) // shareable pubkey to stdout
+	return nil
+}
+
+// writeCertPEM writes a self-signed PEM certificate to certFile (0644) and its
+// PKCS#8 private key to keyFile (0600). Together they let an OpenSSL-family
+// client (curl --cert/--key, openssl s_client, most language TLS stacks) connect
+// straight to a bktunnel server without running the bktunnel proxy: the server
+// pins the bare public key, which is identical to the base64 key files, so these
+// authenticate the same identity. The caller has already confirmed any overwrite
+// of the private key (these files are derived from it), so this does not prompt.
+func writeCertPEM(certFile, keyFile string, priv ed25519.PrivateKey) error {
+	der, err := certDER(priv, true)
+	if err != nil {
+		return err
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return err
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	// Same create-fresh discipline as writeKeypair: remove then WriteFile so the
+	// mode is applied to a new file rather than inherited from an old one. The key
+	// carries the secret, so it is 0600; the cert is public, so 0644.
+	_ = os.Remove(certFile)
+	_ = os.Remove(keyFile)
+	if err := os.WriteFile(keyFile, keyPEM, 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(certFile, certPEM, 0o644); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "certificate written to %s\n", certFile)
+	fmt.Fprintf(os.Stderr, "cert key    written to %s\n", keyFile)
 	return nil
 }
 
@@ -506,6 +575,7 @@ func main() {
 	connect := flag.String("c", "", "connect address:port")
 	privArg := flag.String("k", "", "private key: literal | - | @file (else ~/.bktunnel/id_ed25519, then $TUNNEL_PRIVKEY)")
 	genOut := flag.String("g", "", "generate keypair: -g FILE writes FILE + FILE.pub; -g - stdout; bare -g prompts for a path (default ~/.bktunnel/id_ed25519)")
+	pemOut := flag.Bool("pem", false, "with -g to a file: also write FILE.crt (PEM cert) + FILE.key (PKCS#8 key) so curl/openssl-family clients can connect without the bktunnel proxy")
 	pubOnly := flag.Bool("P", false, "print this host's pubkey (from -k / default key / $TUNNEL_PRIVKEY), then exit")
 	showV := flag.Bool("v", false, "print version and exit")
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -549,14 +619,16 @@ func main() {
 				if pdir == dir {
 					_ = os.Chmod(dir, 0o700) // tighten our own default dir if it pre-existed loose
 				}
-				fatal(writeKeypair(path, seedB64, pubB64))
+				fatal(writeKeypair(path, priv, seedB64, pubB64, *pemOut))
 			} else {
+				warnPEMToStdout(*pemOut)
 				genToStdout(seedB64, pubB64) // non-interactive: behave as -g -
 			}
 		case *genOut == "-":
+			warnPEMToStdout(*pemOut)
 			genToStdout(seedB64, pubB64)
 		default:
-			fatal(writeKeypair(*genOut, seedB64, pubB64))
+			fatal(writeKeypair(*genOut, priv, seedB64, pubB64, *pemOut))
 		}
 		if *privArg != "" {
 			log.Println("warning: -k ignored; using the freshly generated private key")

@@ -137,6 +137,12 @@ Key generation:
               starts afterwards using the freshly generated private key as THIS
               host's identity. The file-writing forms also print the 'pubkey'
               line to stdout; hand it to the PEER for its -p.
+  --pem       with -g to a FILE: ALSO write FILE.crt (a self-signed PEM cert over
+              the same key, 0644) and FILE.key (the PKCS#8 private key, 0600), so
+              an OpenSSL-family client (curl --cert/--key, openssl s_client) or a
+              stock TLS server can use this identity WITHOUT the bktunnel proxy -
+              the peer still pins the bare pubkey. Ignored when generating to
+              stdout (there is no file to write beside).
 
 Default files (~/.bktunnel, ssh-style - used only as fallbacks):
   private key (-k default):   $CFG_ID_FILE
@@ -156,8 +162,11 @@ Examples:
   # generate a keypair to stdout and quit
   bktunnel -g -
 
-  # generate into a chosen file pair (writes FILE and FILE.pub)
-  bktunnel -g ~/id_ed25519
+  # generate into a chosen file pair (writes FILE and FILE.pub alongside)
+  bktunnel -g ~/.bktunnel/id_ed25519
+
+  # ... and also export a PEM cert/key for curl/openssl (writes FILE.crt/.key)
+  bktunnel -g ~/.bktunnel/id_ed25519 --pem
 
   # generate a FRESH identity and immediately run with it (peer still pinned)
   bktunnel -g - -r client -a 127.0.0.1:5560 -c server:5560 -p "\$SERVER_PUBKEY"
@@ -208,19 +217,42 @@ confirm_overwrite(){
   [[ $ans == [yY] || $ans == [yY][eE][sS] ]]
 }
 
-# write_keypair PRIV PUB PRIVFILE PUBFILE: ssh-keygen-style split write - the
-# private key (0600) with a "# privkey" comment and the public key (0644) with
-# a "# pubkey" comment, and echoes the shareable pubkey to stdout. Prompts
-# before overwriting the private key; that one yes covers the .pub too (it is
-# derivable, not a separate secret).
+# write_cert_pem PRIV CERTFILE KEYFILE: from a raw base64 seed, write the PKCS#8
+# PEM private key to KEYFILE (0600) and a self-signed PEM certificate over it to
+# CERTFILE (0644). These let an OpenSSL-family client (curl --cert/--key, openssl
+# s_client) or a stock TLS server use the bktunnel identity WITHOUT running the
+# proxy: the peer still pins the bare public key, identical across all the files.
+# Unlike the runtime node.crt this cert IS self-signed (issuer == subject = the
+# key-hash CN) - that is the plain form standalone tools expect when a cert is
+# handed to them directly rather than chained. The caller has already confirmed
+# any overwrite of the private key (these are derived from it), so no prompt.
+write_cert_pem(){
+  local priv=$1 certf=$2 keyf=$3 mycn
+  rm -f -- "$certf" "$keyf"                        # create fresh: mode from umask
+  ( umask 077; { printf '%s' "$CFG_DER_PRIV_HDR"|xxd -r -p; base64 -d <<<"$priv"; } \
+      | openssl pkey -inform DER > "$keyf" )
+  mycn=$(openssl pkey -in "$keyf" -pubout -outform DER | "$CFG_CN_HASH" | cut -c1-"$CFG_CN_LEN")
+  ( umask 022; openssl req -x509 -new -key "$keyf" -days "$CFG_CERT_DAYS" \
+      -subj "/CN=$mycn" -out "$certf" )
+  printf 'certificate written to %s\n' "$certf" >&2
+  printf 'cert key    written to %s\n' "$keyf"  >&2
+}
+
+# write_keypair PRIV PUB PRIVFILE PUBFILE [EMIT_PEM]: ssh-keygen-style split
+# write - the private key (0600) with a "# privkey" comment and the public key
+# (0644) with a "# pubkey" comment, and echoes the shareable pubkey to stdout.
+# When EMIT_PEM is 1 it also writes PRIVFILE.crt/PRIVFILE.key (see
+# write_cert_pem). Prompts before overwriting the private key; that one yes
+# covers the .pub, .crt and .key too (all derivable, not separate secrets).
 write_keypair(){
-  local priv=$1 pub=$2 pf=$3 pubf=$4
+  local priv=$1 pub=$2 pf=$3 pubf=$4 emit=${5:-0}
   confirm_overwrite "$pf" || return 1
   rm -f -- "$pf" "$pubf"                          # create fresh: mode comes from umask, never a stale/loose one
   ( umask 077; printf '%s # privkey\n' "$priv" > "$pf" )
   ( umask 022; printf '%s # pubkey\n'  "$pub"  > "$pubf" )
   printf 'private key written to %s\n' "$pf"   >&2
   printf 'public key  written to %s\n' "$pubf" >&2
+  (( emit )) && { write_cert_pem "$priv" "$pf.crt" "$pf.key" || return 1; }
   printf 'pubkey %s\n' "$pub"                     # shareable pubkey to stdout
 }
 
@@ -239,6 +271,16 @@ MY_PRIV=''; KEY_SET=0
 GEN_OUT=''; GEN_SET=0; GEN_HASOUT=0
 PUBKEY_ONLY=0
 PEER_PUBS=()
+
+# --pem is a long option; getopts handles only short ones, so pull it out of the
+# argument list first (it may appear anywhere) and parse what remains as before.
+PEM_SET=0
+_args=()
+for _a in "$@"; do
+  if [[ $_a == --pem ]]; then PEM_SET=1; else _args+=("$_a"); fi
+done
+set -- ${_args[@]+"${_args[@]}"}
+
 while getopts ':r:a:c:k:p:ghP' opt; do
   case "$opt" in
     r) ROLE=$OPTARG ;;
@@ -295,11 +337,16 @@ if (( GEN_SET )); then
   GEN_PUB=${GEN_KP#*$'\n'}; GEN_PUB=${GEN_PUB#pubkey}         # drop label ...
   GEN_PUB=${GEN_PUB#"${GEN_PUB%%[![:space:]]*}"}             # ... and spaces -> bare pubkey
 
+  # --pem writes cert/key next to a destination file; there is no file when
+  # generating to stdout, so warn and ignore it there.
+  warn_pem_stdout(){ (( PEM_SET )) && echo "warning: --pem ignored when generating to stdout (needs a file destination)" >&2 || :; }
+
   if (( GEN_HASOUT )); then
     if [[ $GEN_OUT == - ]]; then
+      warn_pem_stdout
       gen_to_stdout                              # explicit stdout
     else
-      write_keypair "$GEN_PRIV" "$GEN_PUB" "$GEN_OUT" "$GEN_OUT.pub" || exit 1
+      write_keypair "$GEN_PRIV" "$GEN_PUB" "$GEN_OUT" "$GEN_OUT.pub" "$PEM_SET" || exit 1
     fi
   elif [[ -t 0 ]]; then
     # -g with no destination, interactive: ask where to save (ssh-keygen style),
@@ -312,8 +359,9 @@ if (( GEN_SET )); then
     gdir=$(dirname -- "$gpf")
     mkdir -p -m 0700 -- "$gdir"
     [[ $gdir == "$CFG_BK_DIR" ]] && chmod 0700 -- "$CFG_BK_DIR"   # tighten our own dir if it pre-existed loose
-    write_keypair "$GEN_PRIV" "$GEN_PUB" "$gpf" "$gpf.pub" || exit 1
+    write_keypair "$GEN_PRIV" "$GEN_PUB" "$gpf" "$gpf.pub" "$PEM_SET" || exit 1
   else
+    warn_pem_stdout
     gen_to_stdout                                # no destination, non-interactive: behave as -g -
   fi
 

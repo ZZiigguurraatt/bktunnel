@@ -640,8 +640,90 @@ private key to `FILE` (`0600`) and the public key to `FILE.pub` (`0644`), while 
 bare `-g` prompts for a path (default `~/.bktunnel/id_ed25519`):
 
 ```sh
-bktunnel -g ~/id_ed25519   # writes ~/id_ed25519 and ~/id_ed25519.pub
+bktunnel -g ~/.bktunnel/id_ed25519   # writes that file and its .pub alongside
 ```
+
+The `.pub` (and the `.crt`/`.key` below) are always written next to the path you
+give `-g`; nothing is forced into `~/.bktunnel`. That directory is only the
+*default* for a bare `-g` with no path. Writing to `~/.bktunnel/id_ed25519` is
+handy because it is also where `-k` looks by default, so the key becomes this
+host's identity with no extra flags.
+
+#### Standalone client cert (`--pem`)
+
+Add `--pem` to a file-destination `-g` to also write `FILE.crt` (a self-signed
+PEM certificate over the same key, `0644`) and `FILE.key` (the matching PKCS#8
+private key, `0600`) beside `FILE`:
+
+```sh
+bktunnel -g ~/.bktunnel/id_ed25519 --pem   # + id_ed25519.crt and id_ed25519.key
+```
+
+These let an **OpenSSL-family client connect straight to a `bktunnel` server
+without running the `bktunnel` proxy** — the server pins the bare public key,
+which is identical across all four files, so the cert authenticates the same
+identity:
+
+```sh
+# The server shares its base64 pubkey (the value you'd pass to -p). Convert it to
+# curl's pin — sha256 of the Ed25519 SPKI, base64 — by prepending the fixed
+# Ed25519 SPKI DER header (the same constant the bash tool uses):
+PIN=$( { printf '302a300506032b6570032100' | xxd -r -p; base64 -d <<<"$SERVER_PUBKEY"; } \
+  | openssl dgst -sha256 -binary | openssl base64 )
+
+# --pinnedpubkey is enforced even with -k, so the pin — not a CA —
+# authenticates the server, reproducing what bktunnel's -p does:
+curl -k --pinnedpubkey "sha256//$PIN" \
+  --cert ~/.bktunnel/id_ed25519.crt --key ~/.bktunnel/id_ed25519.key \
+  https://server:5560/...
+```
+
+The `pubkey` you hand a `bktunnel` server operator is unchanged, so no
+server-side change is needed. `--pem` is ignored when generating to stdout (`-g -`), which has no
+file destination. The server presents its own pinned, non-CA certificate: `-k`
+skips the CA check, and `--pinnedpubkey` authenticates it by key instead — a
+mismatch aborts the request (`curl: (90) SSL: public key does not match pinned
+public key`). Omit `--pinnedpubkey` for a quick connection that leaves the
+server unauthenticated; a browser, lacking a pin option, must instead be told to
+trust the server cert.
+
+`FILE.key` is a **second at-rest copy of your private key** (the same secret as
+`FILE`, PKCS#8-encoded), so it is written `0600` and is yours to protect and
+shred like any key file — which is why `--pem` is opt-in rather than emitted by
+every `-g`. It does not change the proxy's RAM-only runtime; these files exist
+for a stock TLS client or server used *instead* of the `bktunnel` proxy.
+
+##### Replacing the server proxy, too
+
+The `.crt`/`.key` are a plain Ed25519 identity, not client-specific — any TLS
+tool can load them on **either** end. So you can equally drop the proxy on the
+*server* side: point a stock TLS terminator (nginx, stunnel, socat, a Go
+`tls.Listen`) at your backend, give it `FILE.crt`/`FILE.key` as its server
+certificate, and a `bktunnel` *client* that pins the server's pubkey with `-p`
+will accept it.
+
+What you keep versus give up is about **which pin each role owns**. `bktunnel`
+normally does two independent pins: the client authenticates the server (the
+client's `-p`) and the server authenticates the client (the server's `-p`). The
+`bktunnel` end you keep always still enforces its pin; the question is whether the
+stock tool you drop in can reproduce the pin *its* role owns:
+
+- **A stock client can reproduce the client's pin.** Authenticating a server by
+  its public key is a normal client feature — `curl --pinnedpubkey`, or pinning
+  the cert via `--cacert` — so a stock client can keep full mutual auth. If you
+  instead tell it to skip verification (`curl -k`), you drop that pin *by
+  choice*, and this becomes exactly as one-way as the server case below.
+- **A stock server usually cannot reproduce the server's pin.** Authenticating a
+  client by its bare public key is not something nginx/stunnel/etc. do — they
+  verify clients against a CA — so on this side the client-authentication pin is
+  dropped *by necessity*.
+
+So neither replacement is inherently lossless: each collapses mutual
+authentication to one-way unless the stock tool re-adds the pin its role owns.
+The practical difference is only that client tools commonly can (pinning a
+server's pubkey is a normal feature) while stock servers commonly cannot
+(bare-pubkey client pinning is not). Replace **both** ends and you have left
+`bktunnel`'s trust model entirely — it is then just two certs with no pinning.
 
 ### Server
 
@@ -1076,10 +1158,11 @@ fails, so nothing reaches the far `nc`.
 - Prefer `-k @FILE` (permissions `0600`, owner-only) or `TUNNEL_PRIVKEY` over a
   literal `-k PRIVKEY`, which leaks the private key into `ps` output and shell
   history.
-- If you generate or store the private key with `-g FILE` / `-k @FILE`, that
-  file is your responsibility: give it permissions `0600` (owner-only), ideally
-  on a RAM-backed or encrypted path. The RAM-only property covers only the
-  tool's derived runtime material, not your private key at rest.
+- If you generate or store the private key with `-g FILE` / `-k @FILE` — or
+  export it with `--pem`, which writes a second copy as `FILE.key` — those files
+  are your responsibility: give them permissions `0600` (owner-only), ideally on
+  a RAM-backed or encrypted path. The RAM-only property covers only the tool's
+  derived runtime material, not your private key at rest.
 - The tool's derived runtime material (bash) only exists under `/dev/shm` for
   the lifetime of the process and is
   [shredded](https://www.gnu.org/software/coreutils/manual/html_node/shred-invocation.html)

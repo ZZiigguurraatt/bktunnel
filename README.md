@@ -684,8 +684,15 @@ file destination. The server presents its own pinned, non-CA certificate: `-k`
 skips the CA check, and `--pinnedpubkey` authenticates it by key instead — a
 mismatch aborts the request (`curl: (90) SSL: public key does not match pinned
 public key`). Omit `--pinnedpubkey` for a quick connection that leaves the
-server unauthenticated; a browser, lacking a pin option, must instead be told to
-trust the server cert.
+server unauthenticated.
+
+These files suit **OpenSSL-family clients** — `curl`, `openssl s_client`, and
+most language TLS stacks — which handle Ed25519 fine. **Browsers cannot use
+them:** Firefox/NSS refuses to import an Ed25519 key from a PKCS#12 (*"The
+PKCS #12 operation failed for unknown reasons"*), so a browser can't load the
+client identity at all. The key type, not the packaging, is the blocker, so no
+`.p12` export would help either — which is why `bktunnel` deliberately provides
+**no PKCS#12 / browser-import option**.
 
 `FILE.key` is a **second at-rest copy of your private key** (the same secret as
 `FILE`, PKCS#8-encoded), so it is written `0600` and is yours to protect and

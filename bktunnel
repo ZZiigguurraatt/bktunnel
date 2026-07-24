@@ -34,6 +34,14 @@ CFG_DER_PRIV_HDR='302e020100300506032b657004220420'
 #   00            0 unused bits (BIT STRING pad byte); your 32 pub bytes follow
 CFG_DER_PUB_HDR='302a300506032b6570032100'
 
+# ECDSA P-256 (prime256v1) DER prefixes, for the optional 'p256' key type — the
+# one browsers/mobile can use as a client cert (they can't import Ed25519).
+# Private: a MINIMAL PKCS#8 (no embedded public key, curve in the AlgorithmId)
+# whose fixed prefix wraps the raw 32-byte scalar. Public: a SubjectPublicKeyInfo
+# whose fixed prefix wraps a 33-byte SEC1 COMPRESSED point (0x02/0x03 || X).
+CFG_DER_PRIV_HDR_P256='3041020100301306072a8648ce3d020106082a8648ce3d030107042730250201010420'
+CFG_DER_PUB_HDR_P256='3039301306072a8648ce3d020106082a8648ce3d030107032200'
+
 # Hash used to derive a stable Certificate CN from a public key, and how many
 # leading hex chars of that digest to keep. Trust is by pin, so the CN is just
 # a human-readable label - but both peers must agree on this scheme.
@@ -67,9 +75,12 @@ CFG_RUNDIR_BASE='/dev/shm'
 #   no -p passed     -> read pinned peer pubkeys from CFG_AUTH_FILE
 # Unlike the RAM material above, these DO live on disk; you opt into them.
 CFG_BK_DIR="${HOME:-}/.bktunnel"
-CFG_ID_FILE="$CFG_BK_DIR/id_ed25519"        # this host's private key
+CFG_ID_FILE="$CFG_BK_DIR/id_ed25519"        # this host's private key (ed25519 default)
 CFG_PUB_FILE="$CFG_BK_DIR/id_ed25519.pub"   # this host's public key
 CFG_AUTH_FILE="$CFG_BK_DIR/authorized_keys" # pinned peer public keys
+# Default identity files tried (in order) when -k is omitted — one per key type,
+# ssh-style. A P-256 key generated with `-g -t p256` lands in id_p256.
+CFG_ID_FILES=("$CFG_BK_DIR/id_ed25519" "$CFG_BK_DIR/id_p256")
 
 # --- stunnel service --------------------------------------------------------
 
@@ -110,9 +121,10 @@ Required options:
               client: local plaintext in;  server: TLS in from peer
   -c ADDR     connect address:port  (destination stunnel FORWARDS to)
               client: TLS out to REMOTE peer;  server: LOCAL plaintext service
-  -p PUBKEY   the OTHER host's raw 32-byte public key, base64
-              -p @FILE reads pubkeys from FILE, one per line; blank lines and
-              '#' comments (whole-line or trailing) are ignored
+  -p PUBKEY   the OTHER host's public key, base64 (optionally '<type> ' prefixed)
+              -p @FILE reads ssh-authorized_keys-style lines from FILE:
+              "[<type>] <base64> [comment]"; blank lines, '#' comments, and text
+              after the key are ignored; ed25519 and p256 pins may be mixed
               repeat -p and/or mix literals with @FILE for multiple peers
               (omit -p) read peers from the default authorized_keys (see below)
 
@@ -121,7 +133,7 @@ Private key (THIS host's stable 32-byte Ed25519 private key, base64) - pick ONE:
   -k -            read the private key from stdin; prompts if stdin is a terminal
   -k @FILE        read the private key from FILE (first line; a leading "privkey"
                   label and/or a trailing '# ...' comment are accepted/stripped)
-  (omit -k)       read the default id_ed25519 (see below), else TUNNEL_PRIVKEY
+  (omit -k)       read the default id_ed25519 (else id_p256; see below), else TUNNEL_PRIVKEY
   (with -g)       -k is OPTIONAL and IGNORED: the generated private key is used
 
 Key generation:
@@ -137,6 +149,10 @@ Key generation:
               starts afterwards using the freshly generated private key as THIS
               host's identity. The file-writing forms also print the 'pubkey'
               line to stdout; hand it to the PEER for its -p.
+  -t TYPE     key type for -g: ed25519 (default) or p256 (ECDSA P-256). Use p256
+              for a peer that must be a browser/mobile client, which can't use an
+              Ed25519 client cert. Both types interoperate and a -p / authorized_keys
+              set may mix them; an ed25519 pin decodes to 32 bytes, a p256 pin to 33.
   --pem       with -g to a FILE: ALSO write FILE.crt (a self-signed PEM cert over
               the same key, 0644) and FILE.key (the PKCS#8 private key, 0600), so
               an OpenSSL-family client (curl --cert/--key, openssl s_client) or a
@@ -146,6 +162,7 @@ Key generation:
 
 Default files (~/.bktunnel, ssh-style - used only as fallbacks):
   private key (-k default):   $CFG_ID_FILE
+                              (else $CFG_BK_DIR/id_p256 for a P-256 identity)
   public key  (written too):  $CFG_PUB_FILE
   peer pins   (-p default):   $CFG_AUTH_FILE
 
@@ -188,22 +205,97 @@ Examples:
 USAGE
 }
 
-# gen_keypair: emit a fresh Ed25519 keypair as two base64 lines "privkey"/"pubkey".
-# The raw 32 bytes are sliced off the fixed-length DER (48-byte PKCS#8 private,
-# 44-byte SPKI public), matching the -k/-p key format used elsewhere here.
+# unpriv ALGO: raw 32-byte seed/scalar (base64 on stdin) -> PKCS#8 PEM private
+# key, prepending the fixed DER prefix for the algorithm.
+unpriv(){
+  local hdr
+  case "${1:-ed25519}" in
+    ed25519) hdr=$CFG_DER_PRIV_HDR ;;
+    p256)    hdr=$CFG_DER_PRIV_HDR_P256 ;;
+    *) echo "error: unknown key type: ${1:-} (want ed25519 or p256)" >&2; return 2 ;;
+  esac
+  { printf '%s' "$hdr" | xxd -r -p; base64 -d; } | openssl pkey -inform DER
+}
+
+# unpub: raw public key (base64 on stdin) -> SPKI PEM. The DECODED LENGTH selects
+# the algorithm: 32 bytes = Ed25519, 33 = P-256 compressed point. That is how a
+# single authorized_keys / -p set mixes both key types.
+unpub(){
+  local b64 n
+  b64=$(cat)
+  n=$(base64 -d <<<"$b64" | wc -c)
+  case "$n" in
+    32) { printf '%s' "$CFG_DER_PUB_HDR" | xxd -r -p; base64 -d <<<"$b64"; } \
+          | openssl pkey -pubin -inform DER ;;
+    33) # Rebuild the SPKI from the compressed point, then re-emit it UNCOMPRESSED.
+        # Identity certs (node.crt) carry the uncompressed point, and stunnel pins
+        # by comparing the cert's SPKI (and its CN = sha256(SPKI)); a compressed
+        # pin cert would hash and compare differently and never match.
+        { printf '%s' "$CFG_DER_PUB_HDR_P256" | xxd -r -p; base64 -d <<<"$b64"; } \
+          | openssl pkey -pubin -inform DER | openssl ec -pubin -conv_form uncompressed 2>/dev/null ;;
+    *) echo "error: pubkey must be 32 (ed25519) or 33 (p-256) bytes, got $n" >&2; return 2 ;;
+  esac
+}
+
+# pub_of ALGO: derive the bare base64 public key from a PKCS#8 PEM private key on
+# stdin — 32 raw bytes for Ed25519, a 33-byte compressed point for P-256.
+pub_of(){
+  if [[ ${1:-} == p256 ]]; then
+    openssl ec -pubout -conv_form compressed -outform DER 2>/dev/null | tail -c 33 | base64
+  else
+    openssl pkey -pubout -outform DER | tail -c 32 | base64
+  fi
+}
+
+# pin_key LINE: extract the base64 public key from an ssh-style authorized_keys
+# line "[<type>] <base64> [comment]" — a '#' starts a comment (whole-line or
+# trailing), an optional leading ed25519/p256 token is skipped, the next field is
+# the key, and anything after it is a free-text comment. Echoes '' for a blank or
+# comment-only line.
+pin_key(){
+  local s=${1%%#*}
+  # shellcheck disable=SC2086
+  set -- $s                               # whitespace-split (base64 has no glob chars)
+  (( $# == 0 )) && return
+  if [[ $1 == ed25519 || $1 == p256 ]]; then printf '%s' "${2:-}"; else printf '%s' "$1"; fi
+}
+
+# gen_keypair ALGO: emit a fresh keypair as two base64 lines "privkey"/"pubkey".
+# For ed25519 the raw 32-byte seed/pub are sliced off the fixed-length DER; for
+# p256 the 32-byte scalar is sliced from the SEC1 DER (after "02 01 01 04 20") and
+# the public key is the 33-byte compressed point.
 gen_keypair(){
-  local der priv pub
-  der=$(openssl genpkey -algorithm "$CFG_ALGO" -outform DER | base64)
-  priv=$(base64 -d <<<"$der" | tail -c 32 | base64)
-  pub=$(base64 -d <<<"$der" | openssl pkey -inform DER -pubout -outform DER | tail -c 32 | base64)
+  local algo=${1:-ed25519} priv pub key sec1
+  case "$algo" in
+    ed25519)
+      local der
+      der=$(openssl genpkey -algorithm ed25519 -outform DER | base64)
+      priv=$(base64 -d <<<"$der" | tail -c 32 | base64)
+      pub=$(base64 -d <<<"$der" | openssl pkey -inform DER -pubout -outform DER | tail -c 32 | base64) ;;
+    p256)
+      key=$(openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256)
+      sec1=$(openssl ec -outform DER 2>/dev/null <<<"$key" | xxd -p -c256)
+      sec1=${sec1#*0201010420}
+      priv=$(printf '%s' "${sec1:0:64}" | xxd -r -p | base64)
+      pub=$(pub_of p256 <<<"$key") ;;
+    *) echo "error: unknown key type: $algo (want ed25519 or p256)" >&2; return 2 ;;
+  esac
   printf 'privkey %s\npubkey  %s\n' "$priv" "$pub"
 }
 
 # gen_to_stdout: the "-g -" behavior. Labelled privkey+pubkey to a terminal
-# (human), or just the bare private key when piped/redirected (machine use).
-# Reads GEN_KP / GEN_PRIV set by the -g block below.
+# (human), or the bare private key when piped/redirected (machine use). For a
+# non-default algorithm the machine form carries an algo label so it round-trips
+# through -k; ed25519 stays a bare line for backward compatibility. Reads
+# GEN_ALGO / GEN_PRIV / GEN_PUB set by the -g block below.
 gen_to_stdout(){
-  if [[ -t 1 ]]; then printf '%s\n' "$GEN_KP"; else printf '%s\n' "$GEN_PRIV"; fi
+  if [[ -t 1 ]]; then
+    printf 'privkey %s %s\npubkey  %s %s\n' "$GEN_ALGO" "$GEN_PRIV" "$GEN_ALGO" "$GEN_PUB"
+  elif [[ $GEN_ALGO == ed25519 ]]; then
+    printf '%s\n' "$GEN_PRIV"
+  else
+    printf '%s %s\n' "$GEN_ALGO" "$GEN_PRIV"
+  fi
 }
 
 # confirm_overwrite FILE: succeed if FILE may be written - it's absent, or the
@@ -230,10 +322,9 @@ confirm_overwrite(){
 # Go one. Standalone clients present the cert regardless of its issuer. The
 # caller has already confirmed any overwrite of the private key, so no prompt.
 write_cert_pem(){
-  local priv=$1 certf=$2 keyf=$3 mycn tmpd
+  local algo=$1 priv=$2 certf=$3 keyf=$4 mycn tmpd
   rm -f -- "$certf" "$keyf"                        # create fresh: mode from umask
-  ( umask 077; { printf '%s' "$CFG_DER_PRIV_HDR"|xxd -r -p; base64 -d <<<"$priv"; } \
-      | openssl pkey -inform DER > "$keyf" )
+  ( umask 077; unpriv "$algo" <<<"$priv" > "$keyf" )
   mycn=$(openssl pkey -in "$keyf" -pubout -outform DER | "$CFG_CN_HASH" | cut -c1-"$CFG_CN_LEN")
   # Mint a throwaway issuer cert (CN=CFG_LEAF_ISSUER) and sign our subject under
   # it, so the leaf is NOT self-signed - issuer NAME differs from subject, same
@@ -256,15 +347,15 @@ write_cert_pem(){
 # write_cert_pem). Prompts before overwriting the private key; that one yes
 # covers the .pub, .crt and .key too (all derivable, not separate secrets).
 write_keypair(){
-  local priv=$1 pub=$2 pf=$3 pubf=$4 emit=${5:-0}
+  local algo=$1 priv=$2 pub=$3 pf=$4 pubf=$5 emit=${6:-0}
   confirm_overwrite "$pf" || return 1
   rm -f -- "$pf" "$pubf"                          # create fresh: mode comes from umask, never a stale/loose one
-  ( umask 077; printf '%s # privkey\n' "$priv" > "$pf" )
-  ( umask 022; printf '%s # pubkey\n'  "$pub"  > "$pubf" )
+  ( umask 077; printf '%s # privkey %s\n' "$priv" "$algo" > "$pf" )
+  ( umask 022; printf '%s %s\n' "$algo" "$pub" > "$pubf" )   # ssh-style: <type> <base64>
   printf 'private key written to %s\n' "$pf"   >&2
   printf 'public key  written to %s\n' "$pubf" >&2
-  (( emit )) && { write_cert_pem "$priv" "$pf.crt" "$pf.key" || return 1; }
-  printf 'pubkey %s\n' "$pub"                     # shareable pubkey to stdout
+  (( emit )) && { write_cert_pem "$algo" "$priv" "$pf.crt" "$pf.key" || return 1; }
+  printf '%s %s\n' "$algo" "$pub"                 # shareable pubkey (paste into authorized_keys)
 }
 
 # have_tunnel_opts: true only if enough was supplied to actually run the tunnel.
@@ -278,8 +369,8 @@ have_tunnel_opts(){
 
 # --- parse CLI ---
 ROLE='' ACCEPT='' CONNECT=''
-MY_PRIV=''; KEY_SET=0
-GEN_OUT=''; GEN_SET=0; GEN_HASOUT=0
+MY_PRIV=''; MY_ALGO=''; KEY_SET=0
+GEN_OUT=''; GEN_SET=0; GEN_HASOUT=0; KEY_TYPE=ed25519
 PUBKEY_ONLY=0
 PEER_PUBS=()
 
@@ -292,12 +383,13 @@ for _a in "$@"; do
 done
 set -- ${_args[@]+"${_args[@]}"}
 
-while getopts ':r:a:c:k:p:ghP' opt; do
+while getopts ':r:a:c:k:p:t:ghP' opt; do
   case "$opt" in
     r) ROLE=$OPTARG ;;
     a) ACCEPT=$OPTARG ;;
     c) CONNECT=$OPTARG ;;
     k) MY_PRIV=$OPTARG; KEY_SET=1 ;;
+    t) KEY_TYPE=$OPTARG ;;
     g) GEN_SET=1; GEN_OUT=''; GEN_HASOUT=0
        # -g takes an OPTIONAL argument. getopts can't express that, so peek at
        # the next token and consume it as the destination unless it's absent or
@@ -312,16 +404,12 @@ while getopts ':r:a:c:k:p:ghP' opt; do
     p) case "$OPTARG" in
          @*) f=${OPTARG#@}                        # strip leading '@'
              [[ -r $f ]] || { echo "error: cannot read pubkey file: $f" >&2; exit 2; }
-             # one base64 pubkey per line; blank lines and '#' comment lines
-             # skipped; last line need not end in a newline (|| [[ -n $line ]])
+             # ssh-style lines "[<type>] <base64> [comment]"; blank/'#'-comment
+             # lines skipped; last line need not end in a newline (|| [[ -n $line ]])
              while IFS= read -r line || [[ -n $line ]]; do
-               line=${line%%#*}                   # strip trailing/whole-line comments
-               line=${line#"${line%%[![:space:]]*}"}   # trim leading whitespace
-               line=${line%"${line##*[![:space:]]}"}   # trim trailing whitespace
-               [[ -n $line ]] || continue         # skip blank / comment-only lines
-               PEER_PUBS+=("$line")
+               k=$(pin_key "$line"); [[ -n $k ]] && PEER_PUBS+=("$k")
              done < "$f" ;;
-         *)  PEER_PUBS+=("$OPTARG") ;;            # literal pubkey
+         *)  k=$(pin_key "$OPTARG"); [[ -n $k ]] && PEER_PUBS+=("$k") ;;  # literal pubkey
        esac ;;
     h) usage; exit 0 ;;
     :) echo "error: -$OPTARG requires an argument" >&2; usage >&2; exit 2 ;;
@@ -333,17 +421,15 @@ done
 # (same one-pubkey-per-line, '#'-comment format as -p @FILE).
 if (( ${#PEER_PUBS[@]} == 0 )) && [[ -r $CFG_AUTH_FILE ]]; then
   while IFS= read -r line || [[ -n $line ]]; do
-    line=${line%%#*}
-    line=${line#"${line%%[![:space:]]*}"}
-    line=${line%"${line##*[![:space:]]}"}
-    [[ -n $line ]] || continue
-    PEER_PUBS+=("$line")
+    k=$(pin_key "$line"); [[ -n $k ]] && PEER_PUBS+=("$k")
   done < "$CFG_AUTH_FILE"
 fi
 
 # --- key generation (runs before private key resolution) ---
 if (( GEN_SET )); then
-  GEN_KP=$(gen_keypair)                          # "privkey <b64>\npubkey  <b64>"
+  case "$KEY_TYPE" in ed25519|p256) ;; *) echo "error: -t must be ed25519 or p256" >&2; exit 2 ;; esac
+  GEN_ALGO=$KEY_TYPE
+  GEN_KP=$(gen_keypair "$GEN_ALGO") || exit 1     # "privkey <b64>\npubkey  <b64>"
   GEN_PRIV=${GEN_KP%%$'\n'*}; GEN_PRIV=${GEN_PRIV#privkey }   # bare private key
   GEN_PUB=${GEN_KP#*$'\n'}; GEN_PUB=${GEN_PUB#pubkey}         # drop label ...
   GEN_PUB=${GEN_PUB#"${GEN_PUB%%[![:space:]]*}"}             # ... and spaces -> bare pubkey
@@ -357,20 +443,21 @@ if (( GEN_SET )); then
       warn_pem_stdout
       gen_to_stdout                              # explicit stdout
     else
-      write_keypair "$GEN_PRIV" "$GEN_PUB" "$GEN_OUT" "$GEN_OUT.pub" "$PEM_SET" || exit 1
+      write_keypair "$GEN_ALGO" "$GEN_PRIV" "$GEN_PUB" "$GEN_OUT" "$GEN_OUT.pub" "$PEM_SET" || exit 1
     fi
   elif [[ -t 0 ]]; then
     # -g with no destination, interactive: ask where to save (ssh-keygen style),
-    # defaulting to ~/.bktunnel/id_ed25519; Enter accepts the default.
-    [[ -n ${HOME:-} ]] || { echo "error: \$HOME is not set; cannot use $CFG_ID_FILE" >&2; exit 2; }
-    printf 'Enter file in which to save the key (%s): ' "$CFG_ID_FILE" >&2
+    # defaulting to ~/.bktunnel/id_<algo> (id_ed25519 or id_p256); Enter accepts it.
+    [[ -n ${HOME:-} ]] || { echo "error: \$HOME is not set; cannot use $CFG_BK_DIR" >&2; exit 2; }
+    gdef="$CFG_BK_DIR/id_$GEN_ALGO"
+    printf 'Enter file in which to save the key (%s): ' "$gdef" >&2
     ans=''; IFS= read -r ans || :
-    gpf=${ans:-$CFG_ID_FILE}                       # empty -> default
+    gpf=${ans:-$gdef}                              # empty -> default
     [[ $gpf == '~' || $gpf == '~/'* ]] && gpf="${HOME}${gpf#\~}"   # expand leading ~
     gdir=$(dirname -- "$gpf")
     mkdir -p -m 0700 -- "$gdir"
     [[ $gdir == "$CFG_BK_DIR" ]] && chmod 0700 -- "$CFG_BK_DIR"   # tighten our own dir if it pre-existed loose
-    write_keypair "$GEN_PRIV" "$GEN_PUB" "$gpf" "$gpf.pub" "$PEM_SET" || exit 1
+    write_keypair "$GEN_ALGO" "$GEN_PRIV" "$GEN_PUB" "$gpf" "$gpf.pub" "$PEM_SET" || exit 1
   else
     warn_pem_stdout
     gen_to_stdout                                # no destination, non-interactive: behave as -g -
@@ -379,6 +466,7 @@ if (( GEN_SET )); then
   # AUTO-USE the fresh private key as THIS host's identity; -k, if any, loses.
   (( KEY_SET )) && echo "warning: -k ignored; using the freshly generated private key" >&2
   MY_PRIV=$GEN_PRIV
+  MY_ALGO=$GEN_ALGO
   KEY_SET=1
 
   # start the tunnel only if the remaining required opts are present
@@ -405,30 +493,47 @@ if (( KEY_SET )); then
          IFS= read -r MY_PRIV < "$f" || : ;;     # from file (first line)
     *)   : ;;                                    # literal value (incl. generated)
   esac
-elif [[ -r $CFG_ID_FILE ]]; then
-  IFS= read -r MY_PRIV < "$CFG_ID_FILE" || :     # default identity (first line)
-elif [[ -n ${TUNNEL_PRIVKEY:-} ]]; then
-  MY_PRIV=$TUNNEL_PRIVKEY
+else
+  # no -k: try each default identity file (either key type), then TUNNEL_PRIVKEY.
+  for _idf in "${CFG_ID_FILES[@]}"; do
+    if [[ -r $_idf ]]; then IFS= read -r MY_PRIV < "$_idf" || :; break; fi
+  done
+  [[ -n $MY_PRIV ]] || MY_PRIV=${TUNNEL_PRIVKEY:-}
 fi
 
-# Normalize: accept a bare base64 key, the labelled "privkey <b64>" line that -g
-# once wrote, or the "<b64> # privkey" line ~/.bktunnel/id_ed25519 now holds, so
-# every form round-trips through -k @FILE / the default identity file.
+# Determine the algorithm (default ed25519) from a "# privkey <algo>" comment or
+# a leading "[privkey] <algo>" label, unless -g already set it. Both key types
+# have a 32-byte secret, so the label is the only way to tell them apart.
+if [[ -z $MY_ALGO ]]; then
+  MY_ALGO=ed25519
+  if [[ $MY_PRIV == *'#'* ]]; then
+    for _w in ${MY_PRIV#*#}; do [[ $_w == p256 || $_w == ed25519 ]] && MY_ALGO=$_w; done
+  fi
+  _v=${MY_PRIV%%#*}; _v=${_v#"${_v%%[![:space:]]*}"}; _v=${_v#privkey }; _v=${_v#"${_v%%[![:space:]]*}"}
+  case $_v in p256[[:space:]]*) MY_ALGO=p256 ;; ed25519[[:space:]]*) MY_ALGO=ed25519 ;; esac
+fi
+
+# Normalize to a bare base64 key: drop a "#..." comment, trim, and strip an
+# optional leading "privkey" word and/or "ed25519"/"p256" label. So the labelled
+# "privkey <b64>" line -g once wrote, the "<b64> # privkey <algo>" file form, and
+# a bare key all round-trip through -k @FILE / the default identity file.
 MY_PRIV=${MY_PRIV%%#*}                            # strip trailing '#...' comment
 MY_PRIV=${MY_PRIV#"${MY_PRIV%%[![:space:]]*}"}   # trim leading whitespace
 MY_PRIV=${MY_PRIV%"${MY_PRIV##*[![:space:]]}"}   # trim trailing whitespace
-if [[ $MY_PRIV == privkey[[:space:]]* ]]; then
-  MY_PRIV=${MY_PRIV#privkey}                     # drop the label ...
-  MY_PRIV=${MY_PRIV#"${MY_PRIV%%[![:space:]]*}"} # ... and the space after it
-fi
+for _lbl in privkey ed25519 p256; do
+  if [[ $MY_PRIV == "$_lbl"[[:space:]]* ]]; then
+    MY_PRIV=${MY_PRIV#"$_lbl"}
+    MY_PRIV=${MY_PRIV#"${MY_PRIV%%[![:space:]]*}"}
+  fi
+done
 
 # --- print pubkey and exit (-P) ---
-# Ed25519's public key derives from the seed, so recover it from the private key.
+# The public key derives from the private key; recover it in the algorithm's bare
+# form (32 raw bytes for ed25519, a 33-byte compressed point for p256).
 if (( PUBKEY_ONLY )); then
   [[ -n $MY_PRIV ]] || { echo "error: no private key provided" >&2; exit 2; }
-  pub=$({ printf '%s' "$CFG_DER_PRIV_HDR"|xxd -r -p; base64 -d <<<"$MY_PRIV"; } \
-        | openssl pkey -inform DER -pubout -outform DER | tail -c 32 | base64)
-  printf 'pubkey %s\n' "$pub"
+  pub=$(unpriv "$MY_ALGO" <<<"$MY_PRIV" | pub_of "$MY_ALGO")
+  printf '%s %s\n' "$MY_ALGO" "$pub"
   exit 0
 fi
 
@@ -452,19 +557,14 @@ trap 'shred -u "$RUN"/* 2>/dev/null || :; rm -rf "$RUN" || :' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# unpriv: raw 32-byte seed (base64) -> PKCS#8 PEM private key
-unpriv(){ { printf '%s' "$CFG_DER_PRIV_HDR"|xxd -r -p; base64 -d; } | openssl pkey -inform DER; }
-
-# unpub: raw 32-byte public key (base64) -> SubjectPublicKeyInfo PEM
-unpub(){  { printf '%s' "$CFG_DER_PUB_HDR"|xxd -r -p; base64 -d; } | openssl pkey -pubin -inform DER; }
-
-# cn: derive a stable CN from a public key (leading hex of its digest)
+# cn: derive a stable CN from a public key (leading hex of its digest).
+# (unpriv/unpub/pub_of are defined near gen_keypair so -g can use them too.)
 cn(){ openssl pkey -pubin -outform DER | "$CFG_CN_HASH" | cut -c1-"$CFG_CN_LEN"; }
 
 # --- our STABLE identity key + pinnable cert ---
 # 0600: the RUN dir is already 0700, but stunnel also checks the key file's own
 # mode and warns ("Insecure file permissions") if group/other can read it.
-( umask 077; unpriv <<<"$MY_PRIV" > "$RUN/node.key" )
+( umask 077; unpriv "$MY_ALGO" <<<"$MY_PRIV" > "$RUN/node.key" )
 MYCN=$(openssl pkey -in "$RUN/node.key" -pubout | cn)
 # The cert carries our public key under CN=$MYCN so the peer can pin it, and is
 # deliberately NOT self-signed (see CFG_LEAF_ISSUER): we sign it with our own key

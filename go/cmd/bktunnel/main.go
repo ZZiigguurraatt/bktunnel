@@ -19,7 +19,10 @@ package main
 
 import (
 	"bufio"
+	"crypto"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -81,28 +84,114 @@ func printVersion() {
 	}
 }
 
-// ---- key material (base64 of raw 32 bytes, same key format as the bash tool) ----
+// ---- key material ----
+//
+// An identity is a fresh Ed25519 seed or an ECDSA P-256 scalar — either way 32
+// raw secret bytes, stored base64 (the bash tool's key format). Public keys
+// travel as "bare" bytes: 32 for Ed25519, a 33-byte compressed point for P-256,
+// so the decoded length alone tells the two apart (that is how a single
+// authorized_keys file mixes both). Private keys are both 32 bytes, so their
+// algorithm rides an "ed25519"/"p256" label that -g writes and -k accepts,
+// defaulting to Ed25519 when absent (backward compatibility).
 
-func decodePriv(b64 string) (ed25519.PrivateKey, error) {
+const (
+	algoEd25519 = "ed25519"
+	algoP256    = "p256"
+)
+
+// defaultKeyName is the at-rest identity filename for a key type (ssh-style:
+// id_ed25519, id_p256), used as the bare-`-g` save default. defaultKeyNames is
+// the search order the no-`-k` default resolution tries.
+func defaultKeyName(algo string) string { return "id_" + algo }
+
+var defaultKeyNames = []string{defaultKeyName(algoEd25519), defaultKeyName(algoP256)}
+
+// generateKey mints a fresh identity key of the named algorithm.
+func generateKey(algo string) (crypto.Signer, error) {
+	switch algo {
+	case algoEd25519:
+		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		return priv, err
+	case algoP256:
+		return ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	}
+	return nil, fmt.Errorf("unknown key type %q (want %s or %s)", algo, algoEd25519, algoP256)
+}
+
+// privSeed returns the algorithm label and the raw 32 secret bytes for a signer
+// — the bare private key bktunnel stores base64.
+func privSeed(priv crypto.Signer) (algo string, seed []byte, err error) {
+	switch k := priv.(type) {
+	case ed25519.PrivateKey:
+		return algoEd25519, k.Seed(), nil
+	case *ecdsa.PrivateKey:
+		if k.Curve != elliptic.P256() {
+			return "", nil, errors.New("only P-256 ECDSA keys are supported")
+		}
+		b := make([]byte, 32)
+		k.D.FillBytes(b)
+		return algoP256, b, nil
+	}
+	return "", nil, errors.New("unsupported private key type")
+}
+
+// decodePriv rebuilds a signer from the algorithm label and base64 32-byte seed.
+func decodePriv(algo, b64 string) (crypto.Signer, error) {
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
 	if err != nil {
 		return nil, fmt.Errorf("private key: %w", err)
 	}
-	if len(raw) != ed25519.SeedSize {
-		return nil, fmt.Errorf("private key must be %d bytes, got %d", ed25519.SeedSize, len(raw))
+	if len(raw) != 32 {
+		return nil, fmt.Errorf("private key must be 32 bytes, got %d", len(raw))
 	}
-	return ed25519.NewKeyFromSeed(raw), nil
+	switch algo {
+	case algoEd25519:
+		return ed25519.NewKeyFromSeed(raw), nil
+	case algoP256:
+		c := elliptic.P256()
+		d := new(big.Int).SetBytes(raw)
+		if d.Sign() == 0 || d.Cmp(c.Params().N) >= 0 {
+			return nil, errors.New("p-256 private scalar out of range")
+		}
+		priv := &ecdsa.PrivateKey{PublicKey: ecdsa.PublicKey{Curve: c}, D: d}
+		priv.X, priv.Y = c.ScalarBaseMult(raw)
+		return priv, nil
+	}
+	return nil, fmt.Errorf("unknown key type %q", algo)
 }
 
-func decodePub(b64 string) (ed25519.PublicKey, error) {
+// barePub is the wire/pin form of a public key: Ed25519 -> 32 raw bytes; ECDSA
+// P-256 -> 33-byte compressed point. The length distinguishes the two.
+func barePub(pub crypto.PublicKey) ([]byte, error) {
+	switch k := pub.(type) {
+	case ed25519.PublicKey:
+		return []byte(k), nil
+	case *ecdsa.PublicKey:
+		if k.Curve != elliptic.P256() {
+			return nil, errors.New("only P-256 ECDSA keys are supported")
+		}
+		return elliptic.MarshalCompressed(k.Curve, k.X, k.Y), nil
+	}
+	return nil, errors.New("unsupported public key type")
+}
+
+// decodePub validates a bare base64 public key and returns its wire bytes,
+// dispatching on decoded length: 32 -> Ed25519, 33 -> P-256 compressed point.
+func decodePub(b64 string) ([]byte, error) {
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
 	if err != nil {
 		return nil, fmt.Errorf("pubkey: %w", err)
 	}
-	if len(raw) != ed25519.PublicKeySize {
-		return nil, fmt.Errorf("pubkey must be %d bytes, got %d", ed25519.PublicKeySize, len(raw))
+	switch len(raw) {
+	case ed25519.PublicKeySize: // 32
+		return raw, nil
+	case 33:
+		if x, _ := elliptic.UnmarshalCompressed(elliptic.P256(), raw); x == nil {
+			return nil, errors.New("invalid P-256 compressed public key")
+		}
+		return raw, nil
 	}
-	return ed25519.PublicKey(raw), nil
+	return nil, fmt.Errorf("pubkey must be 32 (ed25519) or 33 (p-256) bytes, got %d", len(raw))
 }
 
 // identityCert mints an in-memory carrier cert over the identity key. Nothing is
@@ -112,7 +201,7 @@ func decodePub(b64 string) (ed25519.PublicKey, error) {
 // as "issuer not found" (tolerated) and pins us by public key, rather than
 // rejecting a self-signed leaf outright. We still sign with our own key; only
 // the issuer NAME differs from the subject (a self-signed cert sets them equal).
-func identityCert(priv ed25519.PrivateKey) (tls.Certificate, error) {
+func identityCert(priv crypto.Signer) (tls.Certificate, error) {
 	der, err := certDER(priv)
 	if err != nil {
 		return tls.Certificate{}, err
@@ -135,8 +224,8 @@ func identityCert(priv ed25519.PrivateKey) (tls.Certificate, error) {
 // alike — not just the Go one (whose pin check ignores the issuer). Standalone
 // clients (curl, openssl s_client) present the cert regardless of its issuer, so
 // the distinct-issuer form costs them nothing.
-func certDER(priv ed25519.PrivateKey) ([]byte, error) {
-	pub := priv.Public().(ed25519.PublicKey)
+func certDER(priv crypto.Signer) ([]byte, error) {
+	pub := priv.Public()
 	spki, err := x509.MarshalPKIXPublicKey(pub)
 	if err != nil {
 		return nil, err
@@ -157,8 +246,10 @@ func certDER(priv ed25519.PrivateKey) ([]byte, error) {
 
 // ---- pinning ----
 
-// pinVerifier accepts the peer only if its leaf carries one of the pinned keys.
-func pinVerifier(pins []ed25519.PublicKey) func([][]byte, [][]*x509.Certificate) error {
+// pinVerifier accepts the peer only if its leaf's public key matches one of the
+// pinned bare public keys. Ed25519 and P-256 pins may be mixed freely — the
+// comparison is on the bare wire bytes, which differ in length by type.
+func pinVerifier(pins [][]byte) func([][]byte, [][]*x509.Certificate) error {
 	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 		if len(rawCerts) == 0 {
 			return errors.New("peer presented no certificate")
@@ -167,9 +258,9 @@ func pinVerifier(pins []ed25519.PublicKey) func([][]byte, [][]*x509.Certificate)
 		if err != nil {
 			return fmt.Errorf("parse peer cert: %w", err)
 		}
-		peer, ok := leaf.PublicKey.(ed25519.PublicKey)
-		if !ok {
-			return errors.New("peer key is not Ed25519")
+		peer, err := barePub(leaf.PublicKey)
+		if err != nil {
+			return err
 		}
 		for _, pin := range pins {
 			if subtle.ConstantTimeCompare(peer, pin) == 1 {
@@ -180,7 +271,7 @@ func pinVerifier(pins []ed25519.PublicKey) func([][]byte, [][]*x509.Certificate)
 	}
 }
 
-func tlsConfig(cert tls.Certificate, pins []ed25519.PublicKey, isClient bool) *tls.Config {
+func tlsConfig(cert tls.Certificate, pins [][]byte, isClient bool) *tls.Config {
 	cfg := &tls.Config{
 		Certificates: []tls.Certificate{cert}, // used on the server side
 		// TLS 1.2 floor (not 1.3) so we interoperate with the bash/stunnel side
@@ -338,12 +429,17 @@ func allowBareG(args []string) []string {
 }
 
 // genToStdout prints the keypair like `-g -`: labelled lines to a terminal, or
-// just the bare private key when piped/redirected (machine use).
-func genToStdout(seedB64, pubB64 string) {
-	if isTTY(os.Stdout) {
-		fmt.Printf("privkey %s\npubkey  %s\n", seedB64, pubB64)
-	} else {
+// just the bare private key when piped/redirected (machine use). For a non-default
+// algorithm the machine form carries an algo label so it round-trips through -k;
+// Ed25519 stays a bare line for backward compatibility.
+func genToStdout(algo, seedB64, pubB64 string) {
+	switch {
+	case isTTY(os.Stdout):
+		fmt.Printf("privkey %s %s\npubkey  %s %s\n", algo, seedB64, algo, pubB64)
+	case algo == algoEd25519:
 		fmt.Println(seedB64)
+	default:
+		fmt.Printf("%s %s\n", algo, seedB64)
 	}
 }
 
@@ -412,7 +508,7 @@ func confirmOverwrite(path string) error {
 // PEM cert/key pair (see writeCertPEM). It prompts before overwriting the
 // private key; that one yes covers the .pub, .crt and .key too (all are
 // derivable from the private key, not separate secrets).
-func writeKeypair(file string, priv ed25519.PrivateKey, seedB64, pubB64 string, emitCert bool) error {
+func writeKeypair(file string, priv crypto.Signer, algo, seedB64, pubB64 string, emitCert bool) error {
 	pubFile := file + ".pub"
 	if err := confirmOverwrite(file); err != nil {
 		return err
@@ -425,10 +521,12 @@ func writeKeypair(file string, priv ed25519.PrivateKey, seedB64, pubB64 string, 
 	// secret is never in a loose-mode file.
 	_ = os.Remove(file)
 	_ = os.Remove(pubFile)
-	if err := os.WriteFile(file, []byte(seedB64+" # privkey\n"), 0o600); err != nil {
+	if err := os.WriteFile(file, []byte(seedB64+" # privkey "+algo+"\n"), 0o600); err != nil {
 		return err
 	}
-	if err := os.WriteFile(pubFile, []byte(pubB64+" # pubkey\n"), 0o644); err != nil {
+	// ssh-style public line: "<type> <base64>", so the .pub pastes straight into
+	// a peer's authorized_keys.
+	if err := os.WriteFile(pubFile, []byte(algo+" "+pubB64+"\n"), 0o644); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "private key written to %s\n", file)
@@ -438,7 +536,7 @@ func writeKeypair(file string, priv ed25519.PrivateKey, seedB64, pubB64 string, 
 			return err
 		}
 	}
-	fmt.Printf("pubkey %s\n", pubB64) // shareable pubkey to stdout
+	fmt.Printf("%s %s\n", algo, pubB64) // shareable pubkey to stdout (paste into authorized_keys)
 	return nil
 }
 
@@ -451,7 +549,7 @@ func writeKeypair(file string, priv ed25519.PrivateKey, seedB64, pubB64 string, 
 // the on-wire cert (see certDER) so it is accepted by every bktunnel server, not
 // just the Go one. The caller has already confirmed any overwrite of the private
 // key (these files are derived from it), so this does not prompt.
-func writeCertPEM(certFile, keyFile string, priv ed25519.PrivateKey) error {
+func writeCertPEM(certFile, keyFile string, priv crypto.Signer) error {
 	der, err := certDER(priv)
 	if err != nil {
 		return err
@@ -478,11 +576,12 @@ func writeCertPEM(certFile, keyFile string, priv ed25519.PrivateKey) error {
 	return nil
 }
 
-// resolvePriv returns this host's base64 private key from exactly one source:
-// literal, "-"/"@-" (stdin), "@file", or the TUNNEL_PRIVKEY environment var.
-// A leading "privkey" label (as written by -g) is accepted and stripped, so a
-// file produced by `-g FILE` round-trips through -k @FILE.
-func resolvePriv(arg string) (string, error) {
+// resolvePriv returns this host's algorithm and base64 private key from exactly
+// one source: literal, "-"/"@-" (stdin), "@file", or the TUNNEL_PRIVKEY
+// environment var (else the default id_ed25519 file). The "ed25519"/"p256" label
+// that -g writes is parsed out; when absent the algorithm defaults to Ed25519,
+// so a plain base64 key (or a pre-existing id_ed25519 file) still works.
+func resolvePriv(arg string) (algo, b64 string, err error) {
 	var raw string
 	switch {
 	case arg == "-" || arg == "@-":
@@ -492,48 +591,71 @@ func resolvePriv(arg string) (string, error) {
 		line, _ := stdinReader.ReadString('\n')
 		raw = line
 	case strings.HasPrefix(arg, "@"):
-		b, err := os.ReadFile(arg[1:])
-		if err != nil {
-			return "", err
+		b, e := os.ReadFile(arg[1:])
+		if e != nil {
+			return "", "", e
 		}
 		raw = firstLine(string(b))
 	case arg != "":
 		raw = arg
 	default:
-		// no -k: prefer the default identity file, then $TUNNEL_PRIVKEY.
-		if dir, err := bkDir(); err == nil {
-			if b, err := os.ReadFile(filepath.Join(dir, "id_ed25519")); err == nil {
-				return stripPrivLabel(firstLine(string(b))), nil
+		// no -k: prefer a default identity file (either key type), then $TUNNEL_PRIVKEY.
+		if dir, e := bkDir(); e == nil {
+			for _, name := range defaultKeyNames {
+				if b, e := os.ReadFile(filepath.Join(dir, name)); e == nil {
+					a, k := parsePriv(firstLine(string(b)))
+					return a, k, nil
+				}
 			}
 		}
 		if s := os.Getenv("TUNNEL_PRIVKEY"); s != "" {
-			return stripPrivLabel(s), nil
+			a, k := parsePriv(s)
+			return a, k, nil
 		}
-		return "", errors.New("no private key provided")
+		return "", "", errors.New("no private key provided")
 	}
-	return stripPrivLabel(raw), nil
+	a, k := parsePriv(raw)
+	return a, k, nil
 }
 
-// stripPrivLabel drops a trailing "# ..." comment (e.g. the "# privkey"
-// annotation on ~/.bktunnel/id_ed25519; base64 has no '#'), trims whitespace,
-// then drops an optional leading "privkey" label (only when followed by
-// whitespace, so a bare base64 key starting with those letters is left intact).
-func stripPrivLabel(s string) string {
+// parsePriv splits a private-key line into (algorithm, base64 key). It honours
+// the "ed25519"/"p256" token from a trailing "# privkey <algo>" comment (as -g
+// writes) or a leading "[privkey] <algo> <b64>" label, drops the comment and any
+// "privkey" word, and defaults to Ed25519 when no algorithm is present (so a
+// bare base64 key — including a pre-existing id_ed25519 — is read as Ed25519).
+func parsePriv(s string) (algo, b64 string) {
+	algo = algoEd25519
 	if i := strings.IndexByte(s, '#'); i >= 0 {
+		for _, w := range strings.Fields(s[i+1:]) {
+			if w == algoEd25519 || w == algoP256 {
+				algo = w
+			}
+		}
 		s = s[:i]
 	}
 	s = strings.TrimSpace(s)
 	if rest, ok := strings.CutPrefix(s, "privkey"); ok && len(rest) > 0 && (rest[0] == ' ' || rest[0] == '\t') {
 		s = strings.TrimSpace(rest)
 	}
-	return s
+	for _, a := range []string{algoEd25519, algoP256} {
+		if rest, ok := strings.CutPrefix(s, a); ok && len(rest) > 0 && (rest[0] == ' ' || rest[0] == '\t') {
+			algo = a
+			s = strings.TrimSpace(rest)
+			break
+		}
+	}
+	return algo, s
 }
 
 // loadPins expands -p specs (literals and @file lists) into pinned public keys.
 // In @file lists, blank lines and '#' comments (whole-line or trailing) are ignored.
-func loadPins(specs []string) ([]ed25519.PublicKey, error) {
-	var out []ed25519.PublicKey
-	add := func(b64 string) error {
+func loadPins(specs []string) ([][]byte, error) {
+	var out [][]byte
+	add := func(line string) error {
+		b64 := pinKeyField(line)
+		if b64 == "" {
+			return nil // blank or comment-only line
+		}
 		pk, err := decodePub(b64)
 		if err != nil {
 			return err
@@ -548,12 +670,6 @@ func loadPins(specs []string) ([]ed25519.PublicKey, error) {
 				return nil, err
 			}
 			for _, ln := range strings.Split(string(b), "\n") {
-				if i := strings.IndexByte(ln, '#'); i >= 0 {
-					ln = ln[:i]
-				}
-				if ln = strings.TrimSpace(ln); ln == "" {
-					continue
-				}
 				if err := add(ln); err != nil {
 					return nil, err
 				}
@@ -570,6 +686,28 @@ func loadPins(specs []string) ([]ed25519.PublicKey, error) {
 	return out, nil
 }
 
+// pinKeyField extracts the base64 public key from an ssh-style authorized_keys
+// line, "[<type>] <base64> [comment]": a '#' starts a comment (whole-line or
+// trailing), the remainder is whitespace-split, an optional leading type token
+// (ed25519/p256) is skipped, the next field is the key, and any further text is
+// a free-form comment. Returns "" for a blank or comment-only line.
+func pinKeyField(line string) string {
+	if i := strings.IndexByte(line, '#'); i >= 0 {
+		line = line[:i]
+	}
+	f := strings.Fields(line)
+	if len(f) == 0 {
+		return ""
+	}
+	if f[0] == algoEd25519 || f[0] == algoP256 {
+		if len(f) < 2 {
+			return ""
+		}
+		return f[1]
+	}
+	return f[0]
+}
+
 func main() {
 	log.SetFlags(0)
 	role := flag.String("r", "", "role: client|server")
@@ -577,6 +715,7 @@ func main() {
 	connect := flag.String("c", "", "connect address:port")
 	privArg := flag.String("k", "", "private key: literal | - | @file (else ~/.bktunnel/id_ed25519, then $TUNNEL_PRIVKEY)")
 	genOut := flag.String("g", "", "generate keypair: -g FILE writes FILE + FILE.pub; -g - stdout; bare -g prompts for a path (default ~/.bktunnel/id_ed25519)")
+	keyType := flag.String("t", algoEd25519, "key type for -g: ed25519 | p256 (P-256 is for browser/mobile clients that can't use Ed25519)")
 	pemOut := flag.Bool("pem", false, "with -g to a file: also write FILE.crt (PEM cert) + FILE.key (PKCS#8 key) so curl/openssl-family clients can connect without the bktunnel proxy")
 	pubOnly := flag.Bool("P", false, "print this host's pubkey (from -k / default key / $TUNNEL_PRIVKEY), then exit")
 	showV := flag.Bool("v", false, "print version and exit")
@@ -600,20 +739,25 @@ func main() {
 		}
 	}
 
-	var privStr string
+	var privStr, privAlgo string
 
 	if *genOut != "" {
-		pub, priv, err := ed25519.GenerateKey(rand.Reader)
+		algo := *keyType
+		priv, err := generateKey(algo)
+		fatalUsage(err)
+		_, seed, err := privSeed(priv)
 		fatal(err)
-		seedB64 := base64.StdEncoding.EncodeToString(priv.Seed())
-		pubB64 := base64.StdEncoding.EncodeToString(pub)
+		seedB64 := base64.StdEncoding.EncodeToString(seed)
+		pubBare, err := barePub(priv.Public())
+		fatal(err)
+		pubB64 := base64.StdEncoding.EncodeToString(pubBare)
 		switch {
 		case *genOut == genPromptSentinel:
 			// -g with no destination
 			if isTTY(os.Stdin) {
 				dir, err := bkDir()
 				fatal(err)
-				idFile := filepath.Join(dir, "id_ed25519")
+				idFile := filepath.Join(dir, defaultKeyName(algo))
 				// ssh-keygen style: ask where to save, defaulting to idFile.
 				path := promptPath(fmt.Sprintf("Enter file in which to save the key (%s): ", idFile), idFile)
 				pdir := filepath.Dir(path)
@@ -621,37 +765,39 @@ func main() {
 				if pdir == dir {
 					_ = os.Chmod(dir, 0o700) // tighten our own default dir if it pre-existed loose
 				}
-				fatal(writeKeypair(path, priv, seedB64, pubB64, *pemOut))
+				fatal(writeKeypair(path, priv, algo, seedB64, pubB64, *pemOut))
 			} else {
 				warnPEMToStdout(*pemOut)
-				genToStdout(seedB64, pubB64) // non-interactive: behave as -g -
+				genToStdout(algo, seedB64, pubB64) // non-interactive: behave as -g -
 			}
 		case *genOut == "-":
 			warnPEMToStdout(*pemOut)
-			genToStdout(seedB64, pubB64)
+			genToStdout(algo, seedB64, pubB64)
 		default:
-			fatal(writeKeypair(*genOut, priv, seedB64, pubB64, *pemOut))
+			fatal(writeKeypair(*genOut, priv, algo, seedB64, pubB64, *pemOut))
 		}
 		if *privArg != "" {
 			log.Println("warning: -k ignored; using the freshly generated private key")
 		}
-		privStr = seedB64
+		privStr, privAlgo = seedB64, algo
 		// run only if the remaining required tunnel opts are present
 		if *role == "" || *accept == "" || *connect == "" || len(pubs) == 0 {
 			return
 		}
 	} else {
 		var err error
-		privStr, err = resolvePriv(*privArg)
+		privAlgo, privStr, err = resolvePriv(*privArg)
 		fatalUsage(err)
 	}
 
-	priv, err := decodePriv(privStr)
+	priv, err := decodePriv(privAlgo, privStr)
 	fatal(err)
 	if *pubOnly {
-		// Ed25519's public key derives from the seed; recover it from -k.
-		pub := priv.Public().(ed25519.PublicKey)
-		fmt.Printf("pubkey %s\n", base64.StdEncoding.EncodeToString(pub))
+		// derive the public key from the private key and print the ssh-style
+		// "<type> <base64>" line (paste into a peer's authorized_keys).
+		pub, err := barePub(priv.Public())
+		fatal(err)
+		fmt.Printf("%s %s\n", privAlgo, base64.StdEncoding.EncodeToString(pub))
 		return
 	}
 	if *accept == "" || *connect == "" {

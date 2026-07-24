@@ -2,23 +2,34 @@ package main
 
 import "testing"
 
-// TestStripPrivLabel covers the private-key normalizer: it drops a trailing
-// "# ..." comment (the "# privkey" annotation on ~/.bktunnel/id_ed25519), trims,
-// and strips a leading "privkey" label — but leaves a bare key intact.
-func TestStripPrivLabel(t *testing.T) {
-	cases := map[string]string{
-		"ABC=":             "ABC=",
-		"  ABC=  ":         "ABC=",
-		"privkey ABC=":     "ABC=",
-		"ABC= # privkey":   "ABC=",
-		"privkey ABC= # x": "ABC=",
-		"ABC=\n":           "ABC=",
-		"privkeyABC=":      "privkeyABC=", // no space after "privkey" -> not a label
-		"# whole comment":  "",
+// TestParsePriv covers the private-key parser: it splits (algorithm, base64
+// key), honouring an "ed25519"/"p256" token from a "# privkey <algo>" comment or
+// a leading label, dropping the comment and any "privkey" word, and defaulting
+// to Ed25519 when no algorithm is present (a bare key is left intact).
+func TestParsePriv(t *testing.T) {
+	cases := []struct {
+		in         string
+		algo, want string
+	}{
+		{"ABC=", algoEd25519, "ABC="},
+		{"  ABC=  ", algoEd25519, "ABC="},
+		{"privkey ABC=", algoEd25519, "ABC="},
+		{"ABC= # privkey", algoEd25519, "ABC="},
+		{"privkey ABC= # x", algoEd25519, "ABC="},
+		{"ABC=\n", algoEd25519, "ABC="},
+		{"privkeyABC=", algoEd25519, "privkeyABC="}, // no space after "privkey" -> not a label
+		{"# whole comment", algoEd25519, ""},
+		// algorithm detection
+		{"ABC= # privkey p256", algoP256, "ABC="},
+		{"ABC= # privkey ed25519", algoEd25519, "ABC="},
+		{"privkey p256 ABC=", algoP256, "ABC="},
+		{"p256 ABC=", algoP256, "ABC="},
+		{"ed25519 ABC=", algoEd25519, "ABC="},
 	}
-	for in, want := range cases {
-		if got := stripPrivLabel(in); got != want {
-			t.Errorf("stripPrivLabel(%q) = %q, want %q", in, got, want)
+	for _, c := range cases {
+		algo, got := parsePriv(c.in)
+		if algo != c.algo || got != c.want {
+			t.Errorf("parsePriv(%q) = (%q, %q), want (%q, %q)", c.in, algo, got, c.algo, c.want)
 		}
 	}
 }

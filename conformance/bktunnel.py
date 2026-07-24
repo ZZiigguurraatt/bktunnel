@@ -52,6 +52,8 @@ import threading
 
 from cryptography import x509
 from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey, Ed25519PublicKey)
 from cryptography.hazmat.primitives.serialization import (
@@ -73,18 +75,34 @@ def _name(cn):
 
 
 def load_seed(spec):
-    """-k value: base64 32-byte seed, or @FILE holding it (optional '# ...')."""
+    """-k value: base64 32-byte seed/scalar (+ optional '# privkey <algo>' or a
+    leading '[privkey] <algo>' label), or @FILE holding it. Both key types have a
+    32-byte secret, so the algorithm rides a label; it defaults to 'ed25519'.
+    Returns (algo, seed)."""
     if spec.startswith("@"):
         with open(spec[1:]) as f:
             spec = f.read()
-    seed = base64.b64decode(spec.split("#", 1)[0].strip())
+    spec = spec.splitlines()[0] if spec.strip() else ""
+    value, _, comment = spec.partition("#")
+    algo = "ed25519"
+    for w in comment.split():
+        if w in ("ed25519", "p256"):
+            algo = w
+    parts = value.split()
+    if parts and parts[0] == "privkey":
+        parts = parts[1:]
+    if parts and parts[0] in ("ed25519", "p256"):
+        algo = parts[0]
+        parts = parts[1:]
+    seed = base64.b64decode(parts[0]) if parts else b""
     if len(seed) != 32:
         sys.exit("privkey must decode to 32 bytes")
-    return seed
+    return algo, seed
 
 
 def load_pins(specs):
-    """-p values: base64 pubkeys and/or @FILEs of them (one per line)."""
+    """-p values: base64 pubkeys and/or @FILEs of them (one per line). A pin is
+    32 bytes (Ed25519) or a 33-byte P-256 compressed point; both may be mixed."""
     pins = set()
     for spec in specs:
         if spec.startswith("@"):
@@ -93,14 +111,39 @@ def load_pins(specs):
         else:
             lines = [spec]
         for ln in lines:
-            ln = ln.split("#", 1)[0].strip()
-            if not ln:
+            # ssh-style "[<type>] <base64> [comment]"; '#' starts a comment.
+            parts = ln.split("#", 1)[0].split()
+            if not parts:
                 continue
-            raw = base64.b64decode(ln)
-            if len(raw) != 32:
-                sys.exit("pin must decode to 32 bytes: %r" % ln)
+            if parts[0] in ("ed25519", "p256"):
+                if len(parts) < 2:
+                    continue
+                key = parts[1]
+            else:
+                key = parts[0]
+            raw = base64.b64decode(key)
+            if len(raw) not in (32, 33):
+                sys.exit("pin must decode to 32 (ed25519) or 33 (p-256) bytes: %r" % key)
             pins.add(raw)
     return pins
+
+
+def pub_from_bare(raw):
+    """Reconstruct a public key object from its bare wire bytes: 32 -> Ed25519,
+    33 -> P-256 compressed point."""
+    if len(raw) == 32:
+        return Ed25519PublicKey.from_public_bytes(raw)
+    return ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), raw)
+
+
+def bare_pub(pub):
+    """Bare wire bytes for a public key: Ed25519 -> 32 raw bytes; P-256 -> 33-byte
+    compressed point. None for unsupported types."""
+    if isinstance(pub, Ed25519PublicKey):
+        return pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
+    if isinstance(pub, ec.EllipticCurvePublicKey) and isinstance(pub.curve, ec.SECP256R1):
+        return pub.public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
+    return None
 
 
 def _validity():
@@ -113,15 +156,21 @@ def cn_for(pub):
     return hashlib.sha256(spki).hexdigest()[:40]
 
 
-def identity_cert(seed, issuer_cn):
-    """Return (cert_pem, key_pem) for a non-self-signed cert over the seed key."""
-    key = Ed25519PrivateKey.from_private_bytes(seed)
+def identity_cert(algo, seed, issuer_cn):
+    """Return (cert_pem, key_pem) for a non-self-signed cert over the seed key.
+    algo is 'ed25519' (seed = Ed25519 seed) or 'p256' (seed = P-256 scalar)."""
+    if algo == "p256":
+        key = ec.derive_private_key(int.from_bytes(seed, "big"), ec.SECP256R1())
+        sig_hash = hashes.SHA256()  # ECDSA
+    else:
+        key = Ed25519PrivateKey.from_private_bytes(seed)
+        sig_hash = None  # Ed25519 signs with algorithm=None
     nb, na = _validity()
     cert = (x509.CertificateBuilder()
             .subject_name(_name(cn_for(key.public_key()))).issuer_name(_name(issuer_cn))
             .public_key(key.public_key()).serial_number(1)
             .not_valid_before(nb).not_valid_after(na)
-            .sign(key, None))  # Ed25519 signs with algorithm=None
+            .sign(key, sig_hash))
     return (cert.public_bytes(Encoding.PEM),
             key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
 
@@ -134,7 +183,7 @@ def anchor_pem(pin_raw, signer):
     name = _name(LEAF_ISSUER)
     cert = (x509.CertificateBuilder()
             .subject_name(name).issuer_name(name)
-            .public_key(Ed25519PublicKey.from_public_bytes(pin_raw)).serial_number(1)
+            .public_key(pub_from_bare(pin_raw)).serial_number(1)
             .not_valid_before(nb).not_valid_after(na)
             # Must be a valid CA or OpenSSL rejects it as "invalid CA certificate"
             # when it uses this anchor to verify the peer's leaf.
@@ -149,14 +198,12 @@ def anchor_pem(pin_raw, signer):
 
 
 def peer_pub(sslsock):
-    """Raw Ed25519 public key from the peer's leaf cert, or None."""
+    """Bare public key (Ed25519 32 bytes or P-256 33-byte compressed) from the
+    peer's leaf cert, or None."""
     der = sslsock.getpeercert(binary_form=True)
     if not der:
         return None
-    pub = x509.load_der_x509_certificate(der).public_key()
-    if not isinstance(pub, Ed25519PublicKey):
-        return None
-    return pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
+    return bare_pub(x509.load_der_x509_certificate(der).public_key())
 
 
 def client_ctx(certfile, keyfile):
@@ -282,7 +329,8 @@ def main():
     d = tempfile.mkdtemp(prefix="bktunnel-py.", dir=ram)
     keyfile = os.path.join(d, "node.key")
     try:
-        cert_pem, key_pem = identity_cert(load_seed(args.priv), leaf_issuer)
+        algo, seed = load_seed(args.priv)
+        cert_pem, key_pem = identity_cert(algo, seed, leaf_issuer)
         certfile = os.path.join(d, "node.crt")
         with open(certfile, "wb") as f:
             f.write(cert_pem)

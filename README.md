@@ -1,10 +1,11 @@
 # barekey-tunnel
 
 Builds a mutually-authenticated TLS tunnel between two hosts using **pinned
-Ed25519 public keys**.
+public keys** (Ed25519 by default, or ECDSA P-256).
 
-Trust is by pinned public keys, not by a CA. Each side holds a stable 32-byte
-Ed25519 private key and pins the *other* side's 32-byte public key. No certificate
+Trust is by pinned public keys, not by a CA. Each side holds a stable private
+key — Ed25519 by default, or ECDSA P-256 for a peer that must be a browser or
+mobile client — and pins the *other* side's public key. No certificate
 authority, no expiry checks; ephemeral certs and key files derived at runtime
 stay off persistent storage.
 
@@ -25,10 +26,10 @@ can't pick the destination, and `bktunnel` never inspects or routes the traffic
 it carries.
 
 - **Compact key format.** Each identity is a single 44-character base64 line —
-  the raw 32-byte private key (secret) or 32-byte public key (shareable). There
+  the raw private key (secret) or public key (shareable). There
   are no multi-line PEM certificates to copy around; you hand over one short
   line, the way you would a WireGuard key or an SSH `authorized_keys` entry.
-- **Pinned identity.** Each peer is trusted by its raw Ed25519 public key. Any
+- **Pinned identity.** Each peer is trusted by its raw public key (Ed25519 or ECDSA P-256). Any
   certificate involved is just a carrier for that key, verified against the
   pinned public key.
 - **No certificates to manage.** TLS requires each end to present an X.509
@@ -118,7 +119,7 @@ ways across it.
     (                                            )
     (  only ciphertext crosses here:             )
     (  mutually-authenticated TLS with           )
-    (  pinned Ed25519 keys, so a MITM            )
+    (  pinned public keys, so a MITM             )
     (  can neither read the stream nor           )
     (  impersonate either peer                   )
     '-(                                          )-'
@@ -195,7 +196,7 @@ and the like) get transparent recovery for free.
 
 The key-exchange workflow will feel familiar if you've used
 [WireGuard](https://www.wireguard.com/): each host holds a static private key,
-you exchange the corresponding 32-byte public keys out-of-band (base64), and
+you exchange the corresponding public keys out-of-band (base64), and
 each side pins the other's public key. There is no CA and no PKI — trust is
 purely by pinned key, exactly like WireGuard peers.
 
@@ -205,7 +206,7 @@ The differences are in what happens underneath:
   `bktunnel` wraps an arbitrary **TCP** stream in ordinary **TLS** — the
   public keys are carried inside certificates and verified against the pin.
 - **Key type.** WireGuard uses Curve25519 (X25519) keys for its handshake.
-  `bktunnel` uses **Ed25519** signing identities; the actual session keys
+  `bktunnel` uses **Ed25519** (or ECDSA P-256) signing identities; the actual session keys
   come from the TLS handshake, not from the pinned keys directly.
 - **Scope.** WireGuard forwards IP packets and can route whole networks.
   `bktunnel` forwards a single point-to-point socket (one `accept` → one
@@ -232,7 +233,7 @@ Both implementations expose the same flags (`-r/-a/-c/-k/-p/-g`), the same
 `privkey`/`pubkey` base64 key format, and the same `TUNNEL_PRIVKEY` environment
 variable, so a keypair or command line works with either. They are also
 **wire-compatible**: a bash node and a Go node interoperate on the same tunnel
-(the Go side presents an Ed25519 carrier cert whose CN uses the same
+(the Go side presents an Ed25519 or P-256 carrier cert whose CN uses the same
 `sha256(SPKI)[:40]` scheme the bash side pins on). This is exercised by the
 interop tests — see [Tests](#tests).
 
@@ -567,8 +568,8 @@ lines are just omitted. (This is a Go-only extra; the bash script has no
 ```sh
 # print a fresh keypair to stdout
 bktunnel -g -
-# privkey <base64>   <- secret: this host's identity
-# pubkey  <base64>   <- shareable: hand to the PEER's -p
+# privkey ed25519 <base64>   <- secret: this host's identity
+# pubkey  ed25519 <base64>   <- shareable: hand to the PEER's -p
 ```
 
 Or run `bktunnel -g` with no argument to save the pair to
@@ -649,6 +650,24 @@ give `-g`; nothing is forced into `~/.bktunnel`. That directory is only the
 handy because it is also where `-k` looks by default, so the key becomes this
 host's identity with no extra flags.
 
+#### Key type (`-t`)
+
+`-g` mints an Ed25519 identity by default. Pass `-t p256` for an **ECDSA P-256**
+(secp256r1 / prime256v1) identity instead:
+
+```sh
+bktunnel -g ~/.bktunnel/id_p256 -t p256
+```
+
+Ed25519 is the right choice for bktunnel-to-bktunnel tunnels. P-256 exists for
+one case: a peer that must be a **browser or mobile client**, which cannot use an
+Ed25519 client certificate (Firefox/NSS and Android's Conscrypt/Keystore won't
+import an Ed25519 key). The two types interoperate freely — a P-256 client talks
+to an Ed25519 server and vice versa — and a `-p` / `authorized_keys` set may
+**mix** them: an Ed25519 pin decodes to 32 bytes and a P-256 pin to 33, so they
+never collide. So you can keep every bktunnel node on Ed25519 and simply add a
+browser's P-256 pubkey to the server's `authorized_keys`.
+
 #### Standalone client cert (`--pem`)
 
 Add `--pem` to a file-destination `-g` to also write `FILE.crt` (a self-signed
@@ -687,12 +706,19 @@ public key`). Omit `--pinnedpubkey` for a quick connection that leaves the
 server unauthenticated.
 
 These files suit **OpenSSL-family clients** — `curl`, `openssl s_client`, and
-most language TLS stacks — which handle Ed25519 fine. **Browsers cannot use
-them:** Firefox/NSS refuses to import an Ed25519 key from a PKCS#12 (*"The
-PKCS #12 operation failed for unknown reasons"*), so a browser can't load the
-client identity at all. The key type, not the packaging, is the blocker, so no
-`.p12` export would help either — which is why `bktunnel` deliberately provides
-**no PKCS#12 / browser-import option**.
+most language TLS stacks. For a **browser or mobile** client, generate a
+[**P-256**](#key-type--t) identity instead (`-g FILE -t p256 --pem`) and convert
+it to the PKCS#12 those platforms import:
+
+```sh
+openssl pkcs12 -export -inkey FILE.key -in FILE.crt -out FILE.p12   # then import FILE.p12
+```
+
+An **Ed25519** identity can't be used this way: Firefox/NSS and Android refuse to
+import an Ed25519 key from a PKCS#12 (*"The PKCS #12 operation failed for unknown
+reasons"*) — the key type, not the packaging, is the blocker, which is exactly
+why P-256 is offered. The server just pins the client's P-256 pubkey (mixed into
+`authorized_keys`); its own identity can stay Ed25519.
 
 `FILE.key` is a **second at-rest copy of your private key** (the same secret as
 `FILE`, PKCS#8-encoded), so it is written `0600` and is yours to protect and
@@ -702,7 +728,7 @@ for a stock TLS client or server used *instead* of the `bktunnel` proxy.
 
 ##### Replacing the server proxy, too
 
-The `.crt`/`.key` are a plain Ed25519 identity, not client-specific — any TLS
+The `.crt`/`.key` are a plain Ed25519 or P-256 identity, not client-specific — any TLS
 tool can load them on **either** end. So you can equally drop the proxy on the
 *server* side: point a stock TLS terminator (nginx, stunnel, socat, a Go
 `tls.Listen`) at your backend, give it `FILE.crt`/`FILE.key` as its server
@@ -748,14 +774,16 @@ bktunnel -r server -a 0.0.0.0:5560 -c 127.0.0.1:1883 \
     -k @/etc/tunnel/privkey -p @/etc/tunnel/peers.pub
 ```
 
-A `peers.pub` file for `-p @FILE` holds one base64 pubkey per line; blank lines
-and `#` comments (whole-line or trailing) are ignored:
+A `peers.pub` file for `-p @FILE` is ssh-`authorized_keys`-style: one pin per
+line as `[<type>] <base64> [comment]`. The `<type>` (`ed25519` or `p256`) is
+optional — the key's length identifies it — and the two types may be mixed.
+Blank lines, whole-line `#` comments, and any text after the key are ignored:
 
 ```
 # client host
-Iy7ML4xwxIi7B4Ez67yldQSF3nT/O1u3y4w389pdAGY=
-# backup client
-wwy/Nwo5y+eUPl7P+dv5CjT9fybiarNipZ+q+NZNsZg=
+ed25519 Iy7ML4xwxIi7B4Ez67yldQSF3nT/O1u3y4w389pdAGY= alice@laptop
+# backup client (a browser, so p256)
+p256 AhOi5LVCZEdSfxpSyT/DJLfsTrINL+uIF7TzFOF1nwWE bob-phone
 ```
 
 The server handles multiple clients concurrently — each connection gets its own
@@ -802,20 +830,21 @@ TUNNEL_PRIVKEY=$(pass show client/privkey) \
 Lost the `pubkey` but still have the `privkey`? Recover it — the public key is
 derived deterministically from the private key. `-P` accepts the private key
 from any `-k` source (literal, `@FILE`, stdin via `-k -`, or `TUNNEL_PRIVKEY`),
-prints the shareable `pubkey` line, and exits:
+prints the shareable `<type> <base64>` line, and exits:
 
 ```sh
-bktunnel -k @/etc/tunnel/privkey -P     # from a file      -> pubkey <base64>
-pass show tunnel/privkey | bktunnel -k - -P   # from stdin  -> pubkey <base64>
+bktunnel -k @/etc/tunnel/privkey -P     # from a file      -> <type> <base64>
+pass show tunnel/privkey | bktunnel -k - -P   # from stdin  -> <type> <base64>
 bktunnel -g - | bktunnel -k - -P        # generate, then show its pubkey
 ```
 
 ## Pinning peers with `-p`
 
-`-p` takes the *other* host's base64 public key. Repeat it for multiple peers,
-or read a list from a file with `-p @FILE` (one key per line; blank lines and
-`#` comments — whole-line or trailing — are ignored). Literals and `@FILE` may
-be mixed.
+`-p` takes the *other* host's public key (an optionally `<type>`-prefixed base64
+line). Repeat it for multiple peers, or read a list from a file with `-p @FILE`
+(ssh-`authorized_keys`-style: `[<type>] <base64> [comment]` per line; blank
+lines, `#` comments, and text after the key ignored). Literals and `@FILE` may
+be mixed, as may `ed25519` and `p256` pins.
 
 ```sh
 bktunnel -r server -a 0.0.0.0:5560 -c 127.0.0.1:1883 \
@@ -832,18 +861,21 @@ back to them when the matching flag is omitted:
 
 | File | Role | Used when |
 |------|------|-----------|
-| `~/.bktunnel/id_ed25519` | this host's private key | `-k` is omitted |
-| `~/.bktunnel/id_ed25519.pub` | this host's public key | written alongside; hand it to a peer |
-| `~/.bktunnel/authorized_keys` | pinned peer public keys, one per line | no `-p` is passed |
+| `~/.bktunnel/id_ed25519` | this host's private key (Ed25519) | `-k` is omitted |
+| `~/.bktunnel/id_p256` | this host's private key (P-256) | `-k` is omitted and no `id_ed25519` |
+| `~/.bktunnel/id_ed25519.pub` / `id_p256.pub` | this host's public key | written alongside; hand it to a peer |
+| `~/.bktunnel/authorized_keys` | pinned peer public keys, ssh-style (`[<type>] <base64>` per line) | no `-p` is passed |
 
-Running `bktunnel -g` with no `FILE` **at a terminal** prompts for a path
-(ssh-keygen style, defaulting to `~/.bktunnel/id_ed25519` — press Enter to
-accept, or type another path) and writes the pair there (directory `0700`,
-private key `0600`, `.pub` `0644`). Each file
-carries a trailing reminder comment — `<base64> # privkey` and
-`<base64> # pubkey` — which the readers strip, so the files still load cleanly.
-The shareable `pubkey <base64>` line is also echoed to stdout (status goes to
-stderr), so you can copy or pipe it without opening the `.pub`. To pin this host
+With `-k` omitted, `bktunnel` reads `id_ed25519` if present, otherwise `id_p256`
+(one default identity per key type, ssh-style). Running `bktunnel -g` with no
+`FILE` **at a terminal** prompts for a path (ssh-keygen style, defaulting to
+`~/.bktunnel/id_ed25519`, or `~/.bktunnel/id_p256` under `-t p256` — press Enter
+to accept, or type another path) and writes the pair there (directory `0700`,
+private key `0600`, `.pub` `0644`). The private key is written
+`<base64> # privkey <type>` and the `.pub` in ssh style as `<type> <base64>`;
+the readers accept either, so the files still load cleanly. That same
+`<type> <base64>` line is echoed to stdout (status goes to stderr), so you can
+copy or pipe it without opening the `.pub`. To pin this host
 on a peer, append its `id_ed25519.pub` line to that peer's
 `~/.bktunnel/authorized_keys`.
 
@@ -887,7 +919,7 @@ The other `-g` forms run afterward too: `-g FILE` writes the keypair
 
 Policy and structural choices are **hardcoded** near the top of the script
 rather than exposed as flags — they define what the tool *is*. Several are
-security-relevant (the Ed25519 DER headers, `verifyPeer`, the tmpfs run dir,
+security-relevant (the Ed25519/P-256 DER headers, `verifyPeer`, the tmpfs run dir,
 foreground mode). Read the inline comments before changing any of them.
 
 ## Running as a service
@@ -962,9 +994,9 @@ application you *do* control can build the same architecture in directly and
 drop the proxy on that end. The pattern is small and self-contained; it's
 exactly what the Go implementation does:
 
-- give the endpoint a stable Ed25519 keypair, exchange the 32-byte public keys
+- give the endpoint a stable Ed25519 (or P-256) keypair, exchange the public keys
   out-of-band, and pin the peer's;
-- present an Ed25519 cert carrying that key — CN set to `sha256(SPKI)[:40]`, and
+- present an Ed25519 (or P-256) cert carrying that key — CN set to `sha256(SPKI)[:40]`, and
   an issuer name distinct from the subject so it is **not** self-signed (a
   bash/stunnel peer pins you by that CN and rejects a self-signed leaf outright);
 - in `crypto/tls`, set `InsecureSkipVerify: true` plus a `VerifyPeerCertificate`
@@ -979,7 +1011,7 @@ CA-chain building instead, which has a couple of non-obvious traps; see
 documents.
 
 You don't need to control both ends. Because an embedded endpoint is
-wire-compatible with a `bktunnel` proxy (same Ed25519 carrier cert and CN
+wire-compatible with a `bktunnel` proxy (same carrier-cert and CN
 scheme), you can mix and match:
 
 - **Both ends yours:** embed the pattern in each — no `bktunnel` process anywhere.
@@ -1008,7 +1040,7 @@ is no local proxy and no plaintext loopback hop on that side:
     (                                            )
     (  only ciphertext crosses here:             )
     (  mutually-authenticated TLS with           )
-    (  pinned Ed25519 keys, so a MITM            )
+    (  pinned public keys, so a MITM             )
     (  can neither read the stream nor           )
     (  impersonate either peer                   )
     '-(                                          )-'
@@ -1056,7 +1088,7 @@ is no local proxy and no plaintext loopback hop on that side:
     (                                            )
     (  only ciphertext crosses here:             )
     (  mutually-authenticated TLS with           )
-    (  pinned Ed25519 keys, so a MITM            )
+    (  pinned public keys, so a MITM             )
     (  can neither read the stream nor           )
     (  impersonate either peer                   )
     '-(                                          )-'

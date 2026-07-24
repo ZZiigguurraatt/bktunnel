@@ -141,3 +141,14 @@ func TestConformancePEMCertPythonServer(t *testing.T) {
 		t.Fatalf("stock TLS client with --pem cert -> python server: %v", err)
 	}
 }
+
+// TestConformanceP256PythonClientGoServer proves P-256 identities interoperate
+// with the Python conformance implementation (a P-256 mutual-TLS tunnel between
+// the Python client and the Go server).
+func TestConformanceP256PythonClientGoServer(t *testing.T) {
+	requirePython(t)
+	goBin := buildGoBinary(t)
+	if err := tryRoundTrip(runPairAlgo(t, "", goBin, "go", "python", "p256"), 15*time.Second); err != nil {
+		t.Fatalf("python client <-> go server (p256): %v", err)
+	}
+}

@@ -815,12 +815,12 @@ bktunnel -r server -a 0.0.0.0:5560 -c 127.0.0.1:1883 \
     -k @/etc/tunnel/privkey -p @/etc/tunnel/peers.pub
 ```
 
-If you pass no `-p` at all, bktunnel reads `~/.bktunnel/authorized_keys` (same
+If you pass no `-p` at all, `bktunnel` reads `~/.bktunnel/authorized_keys` (same
 format), mirroring SSH — see [Default key files](#default-key-files-bktunnel).
 
 ## Default key files (`~/.bktunnel`)
 
-Like SSH's `~/.ssh`, bktunnel keeps *at-rest* keys under `~/.bktunnel` and falls
+Like SSH's `~/.ssh`, `bktunnel` keeps *at-rest* keys under `~/.bktunnel` and falls
 back to them when the matching flag is omitted:
 
 | File | Role | Used when |

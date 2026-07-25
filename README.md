@@ -668,15 +668,30 @@ to an Ed25519 server and vice versa — and a `-p` / `authorized_keys` set may
 never collide. So you can keep every bktunnel node on Ed25519 and simply add a
 browser's P-256 pubkey to the server's `authorized_keys`.
 
-#### Standalone client cert (`--pem`)
+#### Standalone client cert (`--pem`, `--p12`)
 
-Add `--pem` to a file-destination `-g` to also write `FILE.crt` (a self-signed
-PEM certificate over the same key, `0644`) and `FILE.key` (the matching PKCS#8
+Add `--pem` to a file-destination `-g` to also write `FILE.crt` (a PEM
+certificate over the same key, `0644`) and `FILE.key` (the matching PKCS#8
 private key, `0600`) beside `FILE`:
 
 ```sh
 bktunnel -g ~/.bktunnel/id_ed25519 --pem   # + id_ed25519.crt and id_ed25519.key
 ```
+
+`--pem` and `--p12` also work **without `-g`**, to export from an identity you
+already have: point `-k` at the key file and they write the same files beside it,
+minting no new key. Combine them freely.
+
+```sh
+# export both file sets from an existing key (no new key is generated):
+bktunnel -k @~/.bktunnel/id_p256 --pem --p12   # + id_p256.crt/.key and id_p256.p12
+```
+
+This needs `-k` to name a **file** (a `@FILE` or the default identity file);
+a literal, stdin, or `$TUNNEL_PRIVKEY` key has nowhere to write beside and errors.
+With no tunnel options it exports and exits; with them it exports and then runs.
+Like `-g`, it prompts before overwriting an existing export and refuses to clobber
+one non-interactively (`rm` the file first, or answer `y`, to replace it).
 
 These let an **OpenSSL-family client connect straight to a `bktunnel` server
 without running the `bktunnel` proxy** — the server pins the bare public key,
@@ -707,24 +722,95 @@ server unauthenticated.
 
 These files suit **OpenSSL-family clients** — `curl`, `openssl s_client`, and
 most language TLS stacks. For a **browser or mobile** client, generate a
-[**P-256**](#key-type--t) identity instead (`-g FILE -t p256 --pem`) and convert
-it to the PKCS#12 those platforms import:
+[**P-256**](#key-type--t) identity and add `--p12`, which writes `FILE.p12`, the
+PKCS#12 bundle those platforms import, directly:
 
 ```sh
-openssl pkcs12 -export -inkey FILE.key -in FILE.crt -out FILE.p12   # then import FILE.p12
+bktunnel -g ~/.bktunnel/id_p256 -t p256 --p12   # + id_p256.p12 (and .pub)
 ```
 
+The bundle uses an **empty password** (import it and leave the password blank; see
+[why](#why-the-p12-uses-an-empty-password)). `--p12` can be combined with
+`--pem` if you also want the loose `.crt`/`.key`; alone it just adds the `.p12`.
 An **Ed25519** identity can't be used this way: Firefox/NSS and Android refuse to
 import an Ed25519 key from a PKCS#12 (*"The PKCS #12 operation failed for unknown
 reasons"*) — the key type, not the packaging, is the blocker, which is exactly
-why P-256 is offered. The server just pins the client's P-256 pubkey (mixed into
-`authorized_keys`); its own identity can stay Ed25519.
+why P-256 is offered (`--p12` warns if you pair it with `-t ed25519`). The server
+just pins the client's P-256 pubkey (mixed into `authorized_keys`); its own
+identity can stay Ed25519.
+
+##### Why the `.p12` uses an empty password
+
+A PKCS#12 password protects the private key inside the bundle, but that key is
+the **same secret** already sitting unencrypted in `FILE` (and `FILE.key` with
+`--pem`) — `bktunnel` stores private keys in the clear at rest, protected by file
+mode (`0600`), not a passphrase. A passphrase on only the `.p12` copy would guard
+one of several plaintext copies while leaving the others open, so it buys
+nothing; the `.p12` is written `0600` like the rest.
+
+So `--p12` uses the **empty password** — the field you leave blank at import.
+Note this is *not* the same as a bundle with no cryptography at all: the file is
+still encrypted and MAC'd (AES-256 / PBKDF2, SHA-256 MAC), just with a key
+derived from the empty string. That matters because Firefox/NSS and Android
+**reject** a truly unencrypted, MAC-less PKCS#12 (*"Failed to decode the file …
+not in PKCS #12 format, has been corrupted, or the password … incorrect"*); a
+well-formed bundle needs the MAC even when the password is empty. The upshot is
+that the **import prompt** is answered once, with a blank field:
+
+- **Firefox** asks for the *certificate backup* password when you import the
+  `.p12` (Settings → Privacy & Security → Certificates → *Your Certificates* →
+  *Import*). Leave it blank, click *OK*, and the key lands in Firefox's own
+  certificate store. It is **not** asked again — not on later launches and not
+  when a site requests the client cert. (What Firefox *may* still prompt for is
+  the cert-**selection** dialog — *which* identity to present — and, only if you
+  have set one, the browser's **Primary Password** that locks the whole NSS
+  store; neither is the `.p12`'s blank password.)
+- **macOS/iOS Keychain** and **Android** likewise consume the blank password at
+  install and then treat the key like any other stored identity.
 
 `FILE.key` is a **second at-rest copy of your private key** (the same secret as
 `FILE`, PKCS#8-encoded), so it is written `0600` and is yours to protect and
 shred like any key file — which is why `--pem` is opt-in rather than emitted by
 every `-g`. It does not change the proxy's RAM-only runtime; these files exist
 for a stock TLS client or server used *instead* of the `bktunnel` proxy.
+
+##### Stable on-wire cert across restarts (`--cert`)
+
+By default a running `bktunnel` proxy **mints a fresh carrier cert in RAM at every
+start** — new random serial, new (randomized ECDSA) signature — and presents that.
+Peers don't care: they pin the *public key* and ignore the rest, so the cert
+changes but the identity doesn't. A **browser talking directly to a `bktunnel`
+server** does care, though: its stored trust exception for that host is keyed on
+the whole-cert **fingerprint**, so a cert that changes every restart makes the
+browser re-prompt each time.
+
+`--cert FILE` fixes that for the running tunnel: present `FILE` (a PEM cert — e.g.
+the `FILE.crt` from `-g --pem`) on the wire verbatim instead of minting a new one:
+
+```sh
+# server identity + a persisted cert, generated once:
+bktunnel -g ~/.bktunnel/id_p256 -t p256 --pem
+# run the server presenting that same cert every time:
+bktunnel -r server -a :5560 -c 127.0.0.1:8080 -k @~/.bktunnel/id_p256 \
+  --cert ~/.bktunnel/id_p256.crt -p "p256 <client-pubkey>"
+```
+
+A **bare `--cert`** (no filename) derives `<keyfile>.crt` from the `-k` key file
+(or the default identity file), so with the `--pem` naming you can just write
+`-k @~/.bktunnel/id_p256 --cert` and it picks up `~/.bktunnel/id_p256.crt`. It
+errors if the key came from a literal, stdin, or `$TUNNEL_PRIVKEY` (no file to
+derive from).
+
+Because the bytes are identical run to run, the browser's exception stays valid
+across restarts. The cert's public key must match the identity key (`-k`), or the
+pin a peer holds for you won't match what you present — `bktunnel` checks this at
+startup and refuses a mismatched or unreadable file. This is opt-in and only about
+the *server*-facing cert a browser sees; `bktunnel`-to-`bktunnel` links are
+unaffected either way (they pin the key). It does **not** remove the initial trust
+warning — the cert still has no CA and no SAN, so a browser prompts once — it only
+stops that prompt from *recurring* on every restart. (Note this puts the public
+cert on disk; the private key is unchanged, still `0600`, and `--pem` already
+wrote a key copy there.)
 
 ##### Replacing the server proxy, too
 
@@ -911,6 +997,10 @@ The other `-g` forms run afterward too: `-g FILE` writes the keypair
 -p PUBKEY    peer public key (base64) or @FILE; repeatable
 -g FILE      generate a keypair to FILE, then exit (or run); '-' = stdout —
              labelled privkey+pubkey to a terminal, bare privkey when piped
+-t TYPE      key type for -g: ed25519 (default) | p256 (for a browser/mobile client cert)
+--pem        also write <base>.crt + <base>.key (PEM); <base> = -g FILE, else the -k key file
+--p12        also write <base>.p12 (empty-password PKCS#12 for browser/OS import; use p256)
+--cert[=F]   present PEM cert F on the wire, not a fresh one (bare: derive <keyfile>.crt from -k)
 -P           print this host's pubkey (derived from -k / $TUNNEL_PRIVKEY), then exit
 -h           show help
 ```

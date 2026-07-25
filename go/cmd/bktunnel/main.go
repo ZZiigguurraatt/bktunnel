@@ -46,6 +46,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	pkcs12 "software.sslmate.com/src/go-pkcs12"
 )
 
 // certDays is how long the in-memory carrier cert is valid. Cosmetic: trust is
@@ -209,6 +211,43 @@ func identityCert(priv crypto.Signer) (tls.Certificate, error) {
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}, nil
 }
 
+// loadCert presents a persisted certificate on the wire instead of the in-memory
+// carrier minted by identityCert. Pass --cert FILE.crt (the file `-g --pem`
+// wrote) so the on-wire cert is byte-identical across restarts. Peers pin the
+// public key and ignore the rest, so a loaded cert and a synthesized one are
+// interchangeable to them — but a browser talking to this server keys its stored
+// trust exception on the whole-cert fingerprint, which only stays put if the
+// exact same cert bytes reappear each run (a freshly minted cert has a new serial
+// and a fresh randomized ECDSA signature every time). The loaded cert's public
+// key must match the identity key (-k), or the pin a peer holds for us would
+// never match what we present.
+func loadCert(certFile string, priv crypto.Signer) (tls.Certificate, error) {
+	pemBytes, err := os.ReadFile(certFile)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	block, _ := pem.Decode(pemBytes)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return tls.Certificate{}, fmt.Errorf("--cert %s: no PEM CERTIFICATE block", certFile)
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("--cert %s: %w", certFile, err)
+	}
+	certPub, err := barePub(leaf.PublicKey)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("--cert %s: %w", certFile, err)
+	}
+	keyPub, err := barePub(priv.Public())
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	if subtle.ConstantTimeCompare(certPub, keyPub) != 1 {
+		return tls.Certificate{}, fmt.Errorf("--cert %s public key does not match the identity key (-k)", certFile)
+	}
+	return tls.Certificate{Certificate: [][]byte{block.Bytes}, PrivateKey: priv, Leaf: leaf}, nil
+}
+
 // certDER mints an X.509 certificate over the identity key and returns its DER
 // bytes. It is deliberately NOT self-signed: the subject CN is sha256(SPKI)[:40]
 // (the bash tool's key-hash scheme) while the issuer NAME is leafIssuerCN,
@@ -224,6 +263,15 @@ func identityCert(priv crypto.Signer) (tls.Certificate, error) {
 // alike — not just the Go one (whose pin check ignores the issuer). Standalone
 // clients (curl, openssl s_client) present the cert regardless of its issuer, so
 // the distinct-issuer form costs them nothing.
+//
+// The serial number is random (128-bit), NOT a fixed 1. Every bktunnel cert
+// shares the one issuer name (leafIssuerCN), and X.509 identifies a cert by the
+// (issuer, serial) pair; a fixed serial makes every cert collide on that pair.
+// NSS/Firefox reject the collision (SEC_ERROR_REUSED_ISSUER_AND_SERIAL: "same
+// issuer/serial as an existing cert, but ... not the same cert") the moment a
+// browser holds one bktunnel cert (an imported --p12 client identity) and a
+// bktunnel server presents another. A random serial makes the pair unique, which
+// is also what the bash tool gets from `openssl ... -CAcreateserial`.
 func certDER(priv crypto.Signer) ([]byte, error) {
 	pub := priv.Public()
 	spki, err := x509.MarshalPKIXPublicKey(pub)
@@ -233,8 +281,15 @@ func certDER(priv crypto.Signer) ([]byte, error) {
 	sum := sha256.Sum256(spki)
 	cn := hex.EncodeToString(sum[:])[:40]
 
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, err
+	}
+	if serial.Sign() == 0 {
+		serial = big.NewInt(1) // rand.Int yields [0, 2^128); a serial must be positive
+	}
 	leaf := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
+		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: cn},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(certDays * 24 * time.Hour),
@@ -411,17 +466,30 @@ func bkDir() (string, error) {
 // destination). The NUL prefix keeps it from colliding with a real path.
 const genPromptSentinel = "\x00bktunnel-prompt-default"
 
-// allowBareG lets `-g` take an OPTIONAL argument, which Go's flag package can't
-// express. A `-g` token that is last, or followed by another option (but not a
-// lone "-", which means stdout), gets the sentinel inserted after it so flag
-// parsing still sees a value.
-func allowBareG(args []string) []string {
+// certDeriveSentinel is the value a bare `--cert` (no filename) parses to; it
+// means "derive <keyfile>.crt from the -k / -g key file" (see expandBareOptionalArgs).
+const certDeriveSentinel = "\x00bktunnel-derive-cert"
+
+// expandBareOptionalArgs lets `-g` and `--cert` take an OPTIONAL argument, which
+// Go's flag package can't express. A token that is last, or followed by another
+// option (but not a lone "-", which means stdout for -g), gets a sentinel inserted
+// after it so flag parsing still sees a value: genPromptSentinel for -g,
+// certDeriveSentinel for --cert (meaning "derive <keyfile>.crt from the key file").
+func expandBareOptionalArgs(args []string) []string {
 	out := make([]string, 0, len(args)+1)
+	bare := func(i int) bool {
+		return i+1 >= len(args) || (strings.HasPrefix(args[i+1], "-") && args[i+1] != "-")
+	}
 	for i, a := range args {
 		out = append(out, a)
-		if a == "-g" || a == "--g" {
-			if i+1 >= len(args) || (strings.HasPrefix(args[i+1], "-") && args[i+1] != "-") {
+		switch a {
+		case "-g", "--g":
+			if bare(i) {
 				out = append(out, genPromptSentinel)
+			}
+		case "-cert", "--cert":
+			if bare(i) {
+				out = append(out, certDeriveSentinel)
 			}
 		}
 	}
@@ -443,12 +511,15 @@ func genToStdout(algo, seedB64, pubB64 string) {
 	}
 }
 
-// warnPEMToStdout notes that --pem has no effect when the key goes to stdout:
-// the PEM cert/key are written next to a destination file, and there is no file
-// when generating to stdout.
-func warnPEMToStdout(pemOut bool) {
+// warnFileOnlyToStdout notes that --pem/--p12 have no effect when the key goes
+// to stdout: those files are written next to a destination path, and there is no
+// file when generating to stdout.
+func warnFileOnlyToStdout(pemOut, p12Out bool) {
 	if pemOut {
 		log.Println("warning: --pem ignored when generating to stdout (needs a file destination)")
+	}
+	if p12Out {
+		log.Println("warning: --p12 ignored when generating to stdout (needs a file destination)")
 	}
 }
 
@@ -503,12 +574,12 @@ func confirmOverwrite(path string) error {
 }
 
 // writeKeypair writes the private key to file (0600, "<b64> # privkey") and the
-// public key to file+".pub" (0644, "<b64> # pubkey"), ssh-keygen style, and
-// echoes the shareable pubkey to stdout. When emitCert is set it also writes a
-// PEM cert/key pair (see writeCertPEM). It prompts before overwriting the
-// private key; that one yes covers the .pub, .crt and .key too (all are
-// derivable from the private key, not separate secrets).
-func writeKeypair(file string, priv crypto.Signer, algo, seedB64, pubB64 string, emitCert bool) error {
+// public key to file+".pub" (0644, ssh-style "<type> <b64>"), and echoes the
+// shareable pubkey to stdout. When emitCert is set it also writes a PEM cert/key
+// pair (see writeCertPEM); when emitP12 is set it also writes FILE.p12 (see
+// writeP12). It prompts before overwriting the private key; that one yes covers
+// the .pub, .crt, .key and .p12 too (all derivable, not separate secrets).
+func writeKeypair(file string, priv crypto.Signer, algo, seedB64, pubB64 string, emitCert, emitP12 bool) error {
 	pubFile := file + ".pub"
 	if err := confirmOverwrite(file); err != nil {
 		return err
@@ -536,7 +607,43 @@ func writeKeypair(file string, priv crypto.Signer, algo, seedB64, pubB64 string,
 			return err
 		}
 	}
+	if emitP12 {
+		if err := writeP12(file+".p12", priv); err != nil {
+			return err
+		}
+	}
 	fmt.Printf("%s %s\n", algo, pubB64) // shareable pubkey to stdout (paste into authorized_keys)
+	return nil
+}
+
+// writeP12 writes a PKCS#12 bundle of the identity cert + private key to p12File
+// (0600), for importing into a browser or OS keystore. The bundle uses the EMPTY
+// password: it is still MAC'd and encrypted (as NSS/Firefox and Android require
+// of a well-formed PKCS#12 - a MAC-less, unencrypted bundle is rejected as "not
+// in PKCS#12 format"), but the key is derived from "", so at the import prompt
+// you leave the password blank. A real passphrase would guard nothing extra: the
+// private key is already stored unencrypted at rest (FILE, and FILE.key with
+// --pem). We use the Modern2023 encoder (AES-256-CBC / PBKDF2-SHA256, SHA-256
+// MAC), the same encoding OpenSSL emits by default. Note browsers/mobile cannot
+// import an Ed25519 key from a PKCS#12; use a P-256 identity (-t p256) for those.
+func writeP12(p12File string, priv crypto.Signer) error {
+	der, err := certDER(priv)
+	if err != nil {
+		return err
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		return err
+	}
+	data, err := pkcs12.Modern2023.Encode(priv, cert, nil, "")
+	if err != nil {
+		return err
+	}
+	_ = os.Remove(p12File)
+	if err := os.WriteFile(p12File, data, 0o600); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "PKCS#12     written to %s (empty password; leave the import password blank)\n", p12File)
 	return nil
 }
 
@@ -616,6 +723,31 @@ func resolvePriv(arg string) (algo, b64 string, err error) {
 	}
 	a, k := parsePriv(raw)
 	return a, k, nil
+}
+
+// privKeyFile returns the on-disk file the -k key resolved from, if any: the
+// @FILE path, or the default identity file resolvePriv would read. It returns
+// ("", false) for a key with no backing file (literal, stdin, or the fallback to
+// $TUNNEL_PRIVKEY). A bare `--cert` uses this to derive <keyfile>.crt.
+func privKeyFile(arg string) (string, bool) {
+	switch {
+	case arg == "-" || arg == "@-":
+		return "", false
+	case strings.HasPrefix(arg, "@"):
+		return arg[1:], true
+	case arg != "":
+		return "", false
+	default:
+		if dir, e := bkDir(); e == nil {
+			for _, name := range defaultKeyNames {
+				p := filepath.Join(dir, name)
+				if _, e := os.Stat(p); e == nil {
+					return p, true
+				}
+			}
+		}
+		return "", false
+	}
 }
 
 // parsePriv splits a private-key line into (algorithm, base64 key). It honours
@@ -716,13 +848,15 @@ func main() {
 	privArg := flag.String("k", "", "private key: literal | - | @file (else ~/.bktunnel/id_ed25519, then $TUNNEL_PRIVKEY)")
 	genOut := flag.String("g", "", "generate keypair: -g FILE writes FILE + FILE.pub; -g - stdout; bare -g prompts for a path (default ~/.bktunnel/id_ed25519)")
 	keyType := flag.String("t", algoEd25519, "key type for -g: ed25519 | p256 (P-256 is for browser/mobile clients that can't use Ed25519)")
-	pemOut := flag.Bool("pem", false, "with -g to a file: also write FILE.crt (PEM cert) + FILE.key (PKCS#8 key) so curl/openssl-family clients can connect without the bktunnel proxy")
+	pemOut := flag.Bool("pem", false, "write <base>.crt (PEM cert) + <base>.key (PKCS#8 key) for curl/openssl-family clients; with -g <base> is the new key file, else <base> is the -k key file (export from an existing identity)")
+	p12Out := flag.Bool("p12", false, "write <base>.p12 (empty-password PKCS#12) for browser/OS keystore import (use a p256 identity — browsers can't import Ed25519); with -g <base> is the new key file, else the -k key file")
+	certFile := flag.String("cert", "", "present PEM cert `FILE` on the wire (pubkey must match -k) instead of minting a fresh cert each run, so the on-wire cert stays byte-stable across restarts (e.g. the FILE.crt from -g --pem) and a browser's trust exception sticks; a bare --cert derives <keyfile>.crt from -k")
 	pubOnly := flag.Bool("P", false, "print this host's pubkey (from -k / default key / $TUNNEL_PRIVKEY), then exit")
 	showV := flag.Bool("v", false, "print version and exit")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	var pubs multiFlag
 	flag.Var(&pubs, "p", "peer pubkey (base64) or @file; repeatable (else ~/.bktunnel/authorized_keys)")
-	flag.CommandLine.Parse(allowBareG(os.Args[1:]))
+	flag.CommandLine.Parse(expandBareOptionalArgs(os.Args[1:]))
 
 	if *showV || *showVersion || (flag.NArg() > 0 && flag.Arg(0) == "version") {
 		printVersion()
@@ -740,9 +874,13 @@ func main() {
 	}
 
 	var privStr, privAlgo string
+	keyFilePath := "" // file the identity key came from / was written to (for a bare --cert)
 
 	if *genOut != "" {
 		algo := *keyType
+		if *p12Out && algo == algoEd25519 {
+			log.Println("warning: browsers/mobile can't import an Ed25519 PKCS#12; use -t p256 for a browser client")
+		}
 		priv, err := generateKey(algo)
 		fatalUsage(err)
 		_, seed, err := privSeed(priv)
@@ -765,16 +903,18 @@ func main() {
 				if pdir == dir {
 					_ = os.Chmod(dir, 0o700) // tighten our own default dir if it pre-existed loose
 				}
-				fatal(writeKeypair(path, priv, algo, seedB64, pubB64, *pemOut))
+				fatal(writeKeypair(path, priv, algo, seedB64, pubB64, *pemOut, *p12Out))
+				keyFilePath = path
 			} else {
-				warnPEMToStdout(*pemOut)
+				warnFileOnlyToStdout(*pemOut, *p12Out)
 				genToStdout(algo, seedB64, pubB64) // non-interactive: behave as -g -
 			}
 		case *genOut == "-":
-			warnPEMToStdout(*pemOut)
+			warnFileOnlyToStdout(*pemOut, *p12Out)
 			genToStdout(algo, seedB64, pubB64)
 		default:
-			fatal(writeKeypair(*genOut, priv, algo, seedB64, pubB64, *pemOut))
+			fatal(writeKeypair(*genOut, priv, algo, seedB64, pubB64, *pemOut, *p12Out))
+			keyFilePath = *genOut
 		}
 		if *privArg != "" {
 			log.Println("warning: -k ignored; using the freshly generated private key")
@@ -800,12 +940,57 @@ func main() {
 		fmt.Printf("%s %s\n", privAlgo, base64.StdEncoding.EncodeToString(pub))
 		return
 	}
+	// --pem/--p12 without -g: export files derived from whatever -k resolved to,
+	// written beside the key file (<keyfile>.crt/.key, <keyfile>.p12) - the same
+	// naming a bare --cert reads back. Needs -k to name a FILE (or a default id
+	// file); a literal/stdin/$TUNNEL_PRIVKEY key has nowhere to write beside. Then
+	// run the tunnel if the required opts are present, else exit (same as -g).
+	if *genOut == "" && (*pemOut || *p12Out) {
+		base, ok := privKeyFile(*privArg)
+		if !ok {
+			fatalUsage(errors.New("--pem/--p12 without -g needs -k @FILE (or a default key file) to write beside"))
+		}
+		if *p12Out && privAlgo == algoEd25519 {
+			log.Println("warning: browsers/mobile can't import an Ed25519 PKCS#12; use a p256 identity for a browser client")
+		}
+		// Confirm before clobbering existing exports (the -g path guards its writes
+		// the same way via confirmOverwrite; here there is no new key file to gate on,
+		// so gate on each export target). Refuses non-interactively.
+		if *pemOut {
+			fatal(confirmOverwrite(base + ".crt"))
+			fatal(confirmOverwrite(base + ".key"))
+			fatal(writeCertPEM(base+".crt", base+".key", priv))
+		}
+		if *p12Out {
+			fatal(confirmOverwrite(base + ".p12"))
+			fatal(writeP12(base+".p12", priv))
+		}
+		if *role == "" || *accept == "" || *connect == "" || len(pubs) == 0 {
+			return // export-only
+		}
+	}
 	if *accept == "" || *connect == "" {
 		fatalUsage(errors.New("-a (accept) and -c (connect) are required"))
 	}
 	pins, err := loadPins(pubs)
 	fatalUsage(err)
-	cert, err := identityCert(priv)
+	certPath := *certFile
+	if certPath == certDeriveSentinel { // bare --cert: derive <keyfile>.crt
+		kf := keyFilePath
+		if kf == "" {
+			kf, _ = privKeyFile(*privArg)
+		}
+		if kf == "" {
+			fatalUsage(errors.New("--cert with no filename needs a key FILE (-k @FILE, a default key file, or -g FILE) to derive <keyfile>.crt from"))
+		}
+		certPath = kf + ".crt"
+	}
+	var cert tls.Certificate
+	if certPath != "" {
+		cert, err = loadCert(certPath, priv)
+	} else {
+		cert, err = identityCert(priv)
+	}
 	fatal(err)
 
 	switch *role {

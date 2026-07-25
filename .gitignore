@@ -15,11 +15,15 @@
 coverage.out
 
 # Generated key material — never commit private keys. `-g` writes a private key
-# plus <name>.pub; the examples/tests use *.key, and the default identity is
-# id_ed25519. Ad-hoc test keys with arbitrary names go in scratch/.
+# plus <name>.pub; --pem adds <name>.crt/.key and --p12 adds <name>.p12 (which
+# EMBEDS the private key, empty-password). The default identities are id_ed25519
+# and id_p256. Ad-hoc test keys with arbitrary names go in scratch/.
 *.key
 *.pub
+*.p12
+*.crt
 id_ed25519
+id_p256
 /scratch/
 
 # Commit-message scratchpad (git commit -F commit-message.txt)

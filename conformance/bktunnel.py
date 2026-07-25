@@ -168,7 +168,12 @@ def identity_cert(algo, seed, issuer_cn):
     nb, na = _validity()
     cert = (x509.CertificateBuilder()
             .subject_name(_name(cn_for(key.public_key()))).issuer_name(_name(issuer_cn))
-            .public_key(key.public_key()).serial_number(1)
+            # Random serial, NOT a fixed 1: every bktunnel cert shares the one
+            # issuer name, and X.509 identifies a cert by (issuer, serial), so a
+            # fixed serial collides. NSS/Firefox reject that collision
+            # (SEC_ERROR_REUSED_ISSUER_AND_SERIAL) when a browser holds one such
+            # cert and a peer presents another. Matches the Go/bash tools.
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
             .not_valid_before(nb).not_valid_after(na)
             .sign(key, sig_hash))
     return (cert.public_bytes(Encoding.PEM),
@@ -183,7 +188,7 @@ def anchor_pem(pin_raw, signer):
     name = _name(LEAF_ISSUER)
     cert = (x509.CertificateBuilder()
             .subject_name(name).issuer_name(name)
-            .public_key(pub_from_bare(pin_raw)).serial_number(1)
+            .public_key(pub_from_bare(pin_raw)).serial_number(x509.random_serial_number())
             .not_valid_before(nb).not_valid_after(na)
             # Must be a valid CA or OpenSSL rejects it as "invalid CA certificate"
             # when it uses this anchor to verify the peer's leaf.

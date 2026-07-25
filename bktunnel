@@ -153,12 +153,27 @@ Key generation:
               for a peer that must be a browser/mobile client, which can't use an
               Ed25519 client cert. Both types interoperate and a -p / authorized_keys
               set may mix them; an ed25519 pin decodes to 32 bytes, a p256 pin to 33.
-  --pem       with -g to a FILE: ALSO write FILE.crt (a self-signed PEM cert over
-              the same key, 0644) and FILE.key (the PKCS#8 private key, 0600), so
-              an OpenSSL-family client (curl --cert/--key, openssl s_client) or a
-              stock TLS server can use this identity WITHOUT the bktunnel proxy -
-              the peer still pins the bare pubkey. Ignored when generating to
-              stdout (there is no file to write beside).
+  --pem       write <base>.crt (a PEM cert over the key, 0644) and <base>.key (the
+              PKCS#8 private key, 0600), so an OpenSSL-family client (curl
+              --cert/--key, openssl s_client) or a stock TLS server can use this
+              identity WITHOUT the bktunnel proxy - the peer still pins the bare
+              pubkey. With -g FILE, <base> is the new FILE; WITHOUT -g, <base> is
+              the -k @FILE key (export from an existing identity). Needs a key
+              FILE; ignored when generating to stdout.
+  --p12       write <base>.p12, an empty-password PKCS#12 bundle (0600) of the
+              identity, for import into a browser or OS keystore (leave the import
+              password blank). Use a p256 identity - browsers and mobile can't
+              import an Ed25519 PKCS#12. <base> is the -g FILE, or (without -g) the
+              -k @FILE key. Needs a key FILE; ignored to stdout.
+  --cert[=FILE] when RUNNING the tunnel: present FILE (a PEM cert, e.g. the
+              FILE.crt from '-g --pem') on the wire instead of minting a fresh cert
+              each start. A bare --cert (no FILE) derives <keyfile>.crt from the -k
+              key file (or the default id file). Its pubkey must match the identity
+              key. A peer pins the key and ignores the rest, but a browser keys its
+              trust exception on the whole-cert fingerprint - so reusing the same
+              file keeps that exception valid across restarts. Without it the cert
+              is regenerated (new serial, new signature) each run and the browser
+              re-prompts.
 
 Default files (~/.bktunnel, ssh-style - used only as fallbacks):
   private key (-k default):   $CFG_ID_FILE
@@ -340,14 +355,41 @@ write_cert_pem(){
   printf 'cert key    written to %s\n' "$keyf"  >&2
 }
 
-# write_keypair PRIV PUB PRIVFILE PUBFILE [EMIT_PEM]: ssh-keygen-style split
-# write - the private key (0600) with a "# privkey" comment and the public key
-# (0644) with a "# pubkey" comment, and echoes the shareable pubkey to stdout.
-# When EMIT_PEM is 1 it also writes PRIVFILE.crt/PRIVFILE.key (see
-# write_cert_pem). Prompts before overwriting the private key; that one yes
-# covers the .pub, .crt and .key too (all derivable, not separate secrets).
+# write_p12 ALGO PRIV P12FILE: bundle the identity (private key + its non-self-
+# signed cert, minted exactly as in write_cert_pem) into a PKCS#12 file (0600)
+# for import into a browser or OS keystore. The bundle uses the EMPTY password
+# (-passout pass:): it is still MAC'd and encrypted (openssl's defaults), as
+# NSS/Firefox and Android require of a well-formed PKCS#12 - a MAC-less,
+# unencrypted bundle is rejected ("not in PKCS#12 format"). The key is derived
+# from "", so the importer leaves the password blank. A real passphrase would
+# guard nothing: the private key is already stored unencrypted at rest. Use p256
+# - browsers/mobile can't import an Ed25519 PKCS#12.
+write_p12(){
+  local algo=$1 priv=$2 p12=$3 mycn tmpd
+  tmpd=$(mktemp -d)
+  unpriv "$algo" <<<"$priv" > "$tmpd/k.pem"
+  mycn=$(openssl pkey -in "$tmpd/k.pem" -pubout -outform DER | "$CFG_CN_HASH" | cut -c1-"$CFG_CN_LEN")
+  openssl req -x509 -new -key "$tmpd/k.pem" -days "$CFG_CERT_DAYS" \
+    -subj "$CFG_LEAF_ISSUER" -out "$tmpd/issuer.crt" 2>/dev/null
+  openssl req -new -key "$tmpd/k.pem" -subj "/CN=$mycn" 2>/dev/null \
+    | openssl x509 -req -CA "$tmpd/issuer.crt" -CAkey "$tmpd/k.pem" -CAcreateserial \
+        -days "$CFG_CERT_DAYS" -out "$tmpd/c.crt" 2>/dev/null
+  rm -f -- "$p12"                                   # create fresh: mode from umask
+  ( umask 077; openssl pkcs12 -export \
+      -inkey "$tmpd/k.pem" -in "$tmpd/c.crt" -passout pass: -out "$p12" 2>/dev/null )
+  rm -rf -- "$tmpd"
+  printf 'PKCS#12     written to %s (empty password; leave the import password blank)\n' "$p12" >&2
+}
+
+# write_keypair PRIV PUB PRIVFILE PUBFILE [EMIT_PEM] [EMIT_P12]: ssh-keygen-style
+# split write - the private key (0600) with a "# privkey" comment and the public
+# key (0644) with a "# pubkey" comment, and echoes the shareable pubkey to stdout.
+# When EMIT_PEM is 1 it also writes PRIVFILE.crt/PRIVFILE.key (see write_cert_pem);
+# when EMIT_P12 is 1 it also writes PRIVFILE.p12 (see write_p12). Prompts before
+# overwriting the private key; that one yes covers the .pub, .crt, .key and .p12
+# too (all derivable from the private key, not separate secrets).
 write_keypair(){
-  local algo=$1 priv=$2 pub=$3 pf=$4 pubf=$5 emit=${6:-0}
+  local algo=$1 priv=$2 pub=$3 pf=$4 pubf=$5 emit=${6:-0} emit_p12=${7:-0}
   confirm_overwrite "$pf" || return 1
   rm -f -- "$pf" "$pubf"                          # create fresh: mode comes from umask, never a stale/loose one
   ( umask 077; printf '%s # privkey %s\n' "$priv" "$algo" > "$pf" )
@@ -355,6 +397,7 @@ write_keypair(){
   printf 'private key written to %s\n' "$pf"   >&2
   printf 'public key  written to %s\n' "$pubf" >&2
   (( emit )) && { write_cert_pem "$algo" "$priv" "$pf.crt" "$pf.key" || return 1; }
+  (( emit_p12 )) && { write_p12 "$algo" "$priv" "$pf.p12" || return 1; }
   printf '%s %s\n' "$algo" "$pub"                 # shareable pubkey (paste into authorized_keys)
 }
 
@@ -370,16 +413,34 @@ have_tunnel_opts(){
 # --- parse CLI ---
 ROLE='' ACCEPT='' CONNECT=''
 MY_PRIV=''; MY_ALGO=''; KEY_SET=0
+KEY_FILE=''                              # file the identity key came from (for a bare --cert)
 GEN_OUT=''; GEN_SET=0; GEN_HASOUT=0; KEY_TYPE=ed25519
 PUBKEY_ONLY=0
 PEER_PUBS=()
 
-# --pem is a long option; getopts handles only short ones, so pull it out of the
-# argument list first (it may appear anywhere) and parse what remains as before.
-PEM_SET=0
-_args=()
-for _a in "$@"; do
-  if [[ $_a == --pem ]]; then PEM_SET=1; else _args+=("$_a"); fi
+# --pem and --p12 are boolean long options; --cert takes an OPTIONAL path. getopts
+# handles only short ones, so pull these out of the argument list first (they may
+# appear anywhere) and parse what remains. --cert accepts "--cert F", "--cert=F",
+# or a bare "--cert" (derive <keyfile>.crt from -k). Index-based so --cert can peek
+# the next token: consume it as the path only if it exists and isn't another option.
+PEM_SET=0; P12_SET=0; CERT_FILE=''; CERT_DERIVE=0
+_args=(); _argv=("$@"); _n=${#_argv[@]}; _i=0
+while (( _i < _n )); do
+  _a=${_argv[_i]}
+  case $_a in
+    --pem)    PEM_SET=1 ;;
+    --p12)    P12_SET=1 ;;
+    --cert=*) CERT_FILE=${_a#--cert=} ;;
+    --cert)
+      _nx=${_argv[_i+1]-}
+      if (( _i+1 < _n )) && [[ -n $_nx && $_nx != -* ]]; then
+        CERT_FILE=$_nx; _i=$((_i+1))         # "--cert FILE"
+      else
+        CERT_DERIVE=1                        # bare "--cert" -> derive <keyfile>.crt
+      fi ;;
+    *)        _args+=("$_a") ;;
+  esac
+  _i=$((_i+1))
 done
 set -- ${_args[@]+"${_args[@]}"}
 
@@ -429,21 +490,29 @@ fi
 if (( GEN_SET )); then
   case "$KEY_TYPE" in ed25519|p256) ;; *) echo "error: -t must be ed25519 or p256" >&2; exit 2 ;; esac
   GEN_ALGO=$KEY_TYPE
+  # A PKCS#12 is for a browser/OS keystore, which can't import an Ed25519 one.
+  (( P12_SET )) && [[ $GEN_ALGO == ed25519 ]] && \
+    echo "warning: browsers/mobile can't import an Ed25519 PKCS#12; use -t p256 for a browser client" >&2
   GEN_KP=$(gen_keypair "$GEN_ALGO") || exit 1     # "privkey <b64>\npubkey  <b64>"
   GEN_PRIV=${GEN_KP%%$'\n'*}; GEN_PRIV=${GEN_PRIV#privkey }   # bare private key
   GEN_PUB=${GEN_KP#*$'\n'}; GEN_PUB=${GEN_PUB#pubkey}         # drop label ...
   GEN_PUB=${GEN_PUB#"${GEN_PUB%%[![:space:]]*}"}             # ... and spaces -> bare pubkey
 
-  # --pem writes cert/key next to a destination file; there is no file when
-  # generating to stdout, so warn and ignore it there.
-  warn_pem_stdout(){ (( PEM_SET )) && echo "warning: --pem ignored when generating to stdout (needs a file destination)" >&2 || :; }
+  # --pem/--p12 write files next to a destination file; there is no file when
+  # generating to stdout, so warn and ignore them there.
+  warn_fileonly_stdout(){
+    (( PEM_SET )) && echo "warning: --pem ignored when generating to stdout (needs a file destination)" >&2
+    (( P12_SET )) && echo "warning: --p12 ignored when generating to stdout (needs a file destination)" >&2
+    return 0
+  }
 
   if (( GEN_HASOUT )); then
     if [[ $GEN_OUT == - ]]; then
-      warn_pem_stdout
+      warn_fileonly_stdout
       gen_to_stdout                              # explicit stdout
     else
-      write_keypair "$GEN_ALGO" "$GEN_PRIV" "$GEN_PUB" "$GEN_OUT" "$GEN_OUT.pub" "$PEM_SET" || exit 1
+      write_keypair "$GEN_ALGO" "$GEN_PRIV" "$GEN_PUB" "$GEN_OUT" "$GEN_OUT.pub" "$PEM_SET" "$P12_SET" || exit 1
+      KEY_FILE=$GEN_OUT
     fi
   elif [[ -t 0 ]]; then
     # -g with no destination, interactive: ask where to save (ssh-keygen style),
@@ -457,9 +526,10 @@ if (( GEN_SET )); then
     gdir=$(dirname -- "$gpf")
     mkdir -p -m 0700 -- "$gdir"
     [[ $gdir == "$CFG_BK_DIR" ]] && chmod 0700 -- "$CFG_BK_DIR"   # tighten our own dir if it pre-existed loose
-    write_keypair "$GEN_ALGO" "$GEN_PRIV" "$GEN_PUB" "$gpf" "$gpf.pub" "$PEM_SET" || exit 1
+    write_keypair "$GEN_ALGO" "$GEN_PRIV" "$GEN_PUB" "$gpf" "$gpf.pub" "$PEM_SET" "$P12_SET" || exit 1
+    KEY_FILE=$gpf
   else
-    warn_pem_stdout
+    warn_fileonly_stdout
     gen_to_stdout                                # no destination, non-interactive: behave as -g -
   fi
 
@@ -490,13 +560,14 @@ if (( KEY_SET )); then
     -|@-) read_privkey_stdin ;;                  # stdin (prompts if a terminal)
     @*)  f=${MY_PRIV#@}                          # strip leading '@'
          [[ -r $f ]] || { echo "error: cannot read private key file: $f" >&2; exit 2; }
+         KEY_FILE=$f
          IFS= read -r MY_PRIV < "$f" || : ;;     # from file (first line)
     *)   : ;;                                    # literal value (incl. generated)
   esac
 else
   # no -k: try each default identity file (either key type), then TUNNEL_PRIVKEY.
   for _idf in "${CFG_ID_FILES[@]}"; do
-    if [[ -r $_idf ]]; then IFS= read -r MY_PRIV < "$_idf" || :; break; fi
+    if [[ -r $_idf ]]; then KEY_FILE=$_idf; IFS= read -r MY_PRIV < "$_idf" || :; break; fi
   done
   [[ -n $MY_PRIV ]] || MY_PRIV=${TUNNEL_PRIVKEY:-}
 fi
@@ -537,6 +608,30 @@ if (( PUBKEY_ONLY )); then
   exit 0
 fi
 
+# --- export --pem/--p12 from an existing key (no -g) ---
+# Without -g, --pem/--p12 export files derived from whatever -k resolved to,
+# written beside the key file: <keyfile>.crt/.key for --pem, <keyfile>.p12 for
+# --p12 (the same naming a bare --cert reads back). Needs -k to name a FILE (or a
+# default id file); a literal/stdin/env key has nowhere to write beside. Then run
+# the tunnel if the required opts are present, else exit (same as -g).
+if (( ! GEN_SET )) && { (( PEM_SET )) || (( P12_SET )); }; then
+  [[ -n $MY_PRIV ]] || { echo "error: no private key provided" >&2; exit 2; }
+  [[ -n $KEY_FILE ]] || { echo "error: --pem/--p12 without -g needs -k @FILE (or a default key file) to write beside" >&2; exit 2; }
+  (( P12_SET )) && [[ $MY_ALGO == ed25519 ]] && \
+    echo "warning: browsers/mobile can't import an Ed25519 PKCS#12; use a p256 identity for a browser client" >&2
+  # Confirm before clobbering existing exports (as the -g path does via
+  # confirm_overwrite); refuses non-interactively.
+  (( PEM_SET )) && {
+    confirm_overwrite "$KEY_FILE.crt" && confirm_overwrite "$KEY_FILE.key" || exit 1
+    write_cert_pem "$MY_ALGO" "$MY_PRIV" "$KEY_FILE.crt" "$KEY_FILE.key" || exit 1
+  }
+  (( P12_SET )) && {
+    confirm_overwrite "$KEY_FILE.p12" || exit 1
+    write_p12 "$MY_ALGO" "$MY_PRIV" "$KEY_FILE.p12" || exit 1
+  }
+  [[ -n $ROLE && -n $ACCEPT && -n $CONNECT && ${#PEER_PUBS[@]} -gt 0 ]] || exit 0
+fi
+
 # --- validate ---
 case "$ROLE" in
   client) CLIENT=yes ;;
@@ -572,11 +667,32 @@ MYCN=$(openssl pkey -in "$RUN/node.key" -pubout | cn)
 # local issuer certificate" (tolerated, then it matches us by pinned public key)
 # rather than "self-signed certificate" (rejected before that match). The
 # throwaway issuer cert only signs node.crt; it is never sent to the peer.
-openssl req -x509 -new -key "$RUN/node.key" -days "$CFG_CERT_DAYS" \
-  -subj "$CFG_LEAF_ISSUER" -out "$RUN/issuer.crt"
-openssl req -new -key "$RUN/node.key" -subj "/CN=$MYCN" \
-  | openssl x509 -req -CA "$RUN/issuer.crt" -CAkey "$RUN/node.key" \
-      -CAcreateserial -days "$CFG_CERT_DAYS" -out "$RUN/node.crt"
+#
+# With --cert FILE we present that persisted cert verbatim instead of minting a
+# fresh one, so the on-wire cert is byte-stable across restarts (a peer pins our
+# key and ignores the rest, but a browser keys its trust exception on the whole-
+# cert fingerprint - which only holds still if the same bytes reappear each run).
+# Its pubkey must match our identity key, or the peer's pin for us won't match.
+# A bare --cert derives <keyfile>.crt from the file the identity key came from.
+if (( CERT_DERIVE )) && [[ -z $CERT_FILE ]]; then
+  [[ -n $KEY_FILE ]] || { echo "error: --cert with no filename needs a key FILE (-k @FILE, a default key file, or -g FILE) to derive <keyfile>.crt from" >&2; exit 2; }
+  CERT_FILE="$KEY_FILE.crt"
+fi
+if [[ -n $CERT_FILE ]]; then
+  [[ -r $CERT_FILE ]] || { echo "error: cannot read --cert file: $CERT_FILE" >&2; exit 2; }
+  certpub=$(openssl x509 -in "$CERT_FILE" -pubkey -noout 2>/dev/null \
+            | openssl pkey -pubin -pubout -outform DER 2>/dev/null | openssl sha256 2>/dev/null)
+  keypub=$(openssl pkey -in "$RUN/node.key" -pubout -outform DER | openssl sha256)
+  [[ -n $certpub && $certpub == "$keypub" ]] \
+    || { echo "error: --cert $CERT_FILE public key does not match the identity key" >&2; exit 2; }
+  cp -- "$CERT_FILE" "$RUN/node.crt"
+else
+  openssl req -x509 -new -key "$RUN/node.key" -days "$CFG_CERT_DAYS" \
+    -subj "$CFG_LEAF_ISSUER" -out "$RUN/issuer.crt"
+  openssl req -new -key "$RUN/node.key" -subj "/CN=$MYCN" \
+    | openssl x509 -req -CA "$RUN/issuer.crt" -CAkey "$RUN/node.key" \
+        -CAcreateserial -days "$CFG_CERT_DAYS" -out "$RUN/node.crt"
+fi
 
 # --- throwaway signer + one pin-cert per peer pubkey ---
 # Each pin is a cert CARRYING the peer's pubkey, signed by a throwaway key. We

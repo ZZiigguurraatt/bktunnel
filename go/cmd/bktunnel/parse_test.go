@@ -34,30 +34,36 @@ func TestParsePriv(t *testing.T) {
 	}
 }
 
-// TestAllowBareG covers the optional-argument rewrite for -g: a bare -g (last,
-// or followed by another option) gets the sentinel; -g -, -g FILE, and
-// unrelated flags are left untouched.
-func TestAllowBareG(t *testing.T) {
-	s := genPromptSentinel
+// TestExpandBareOptionalArgs covers the optional-argument rewrite for -g and
+// --cert: a bare token (last, or followed by another option) gets its sentinel;
+// -g -, -g FILE, --cert FILE, and unrelated flags are left untouched.
+func TestExpandBareOptionalArgs(t *testing.T) {
+	g := genPromptSentinel
+	c := certDeriveSentinel
 	cases := []struct {
 		in, want []string
 	}{
-		{[]string{"-g"}, []string{"-g", s}},
+		{[]string{"-g"}, []string{"-g", g}},
 		{[]string{"-g", "-"}, []string{"-g", "-"}},
 		{[]string{"-g", "file"}, []string{"-g", "file"}},
-		{[]string{"-g", "-r", "client"}, []string{"-g", s, "-r", "client"}},
-		{[]string{"-r", "client", "-g"}, []string{"-r", "client", "-g", s}},
+		{[]string{"-g", "-r", "client"}, []string{"-g", g, "-r", "client"}},
+		{[]string{"-r", "client", "-g"}, []string{"-r", "client", "-g", g}},
 		{[]string{"-k", "x"}, []string{"-k", "x"}},
+		{[]string{"--cert"}, []string{"--cert", c}},
+		{[]string{"-cert"}, []string{"-cert", c}},
+		{[]string{"--cert", "id.crt"}, []string{"--cert", "id.crt"}},
+		{[]string{"--cert", "-r", "server"}, []string{"--cert", c, "-r", "server"}},
+		{[]string{"-r", "server", "--cert"}, []string{"-r", "server", "--cert", c}},
 	}
-	for _, c := range cases {
-		got := allowBareG(c.in)
-		if len(got) != len(c.want) {
-			t.Errorf("allowBareG(%v) = %v, want %v", c.in, got, c.want)
+	for _, tc := range cases {
+		got := expandBareOptionalArgs(tc.in)
+		if len(got) != len(tc.want) {
+			t.Errorf("expandBareOptionalArgs(%v) = %v, want %v", tc.in, got, tc.want)
 			continue
 		}
 		for i := range got {
-			if got[i] != c.want[i] {
-				t.Errorf("allowBareG(%v) = %v, want %v", c.in, got, c.want)
+			if got[i] != tc.want[i] {
+				t.Errorf("expandBareOptionalArgs(%v) = %v, want %v", tc.in, got, tc.want)
 				break
 			}
 		}

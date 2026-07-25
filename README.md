@@ -1,7 +1,7 @@
 # barekey-tunnel
 
-Builds a mutually-authenticated TLS tunnel between two hosts using **pinned
-public keys** (Ed25519 by default, or ECDSA P-256).
+Builds a mutually-authenticated TLS (mTLS) tunnel between two hosts using
+**pinned public keys** (Ed25519 by default, or ECDSA P-256).
 
 Trust is by pinned public keys, not by a CA. Each side holds a stable private
 key — Ed25519 by default, or ECDSA P-256 for a peer that must be a browser or
